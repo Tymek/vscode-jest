@@ -58,6 +58,8 @@ function testStatusStyle(property: string) {
     expect(decoration.overviewRulerLane).toBe(vscode.OverviewRulerLane.Left);
     expect(decoration.overviewRulerColor).toBeTruthy();
     expect(decoration.gutterIconPath).toBeTruthy();
+    expect(decoration.dark.gutterIconPath).toBeTruthy();
+    expect(decoration.light.gutterIconPath).toBeTruthy();
   });
 }
 

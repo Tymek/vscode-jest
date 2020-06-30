@@ -6,6 +6,7 @@ import {
   DecorationRangeBehavior,
   ExtensionContext,
   TextEditorDecorationType,
+  DecorationRenderOptions,
 } from 'vscode';
 import passingIcon from 'vscode-codicons/src/icons/check.svg';
 import failingIcon from 'vscode-codicons/src/icons/chrome-close.svg';
@@ -25,10 +26,13 @@ export class Decorations {
   constructor(context) {
     this.context = context;
 
-    this.passing = this.createStateDecoration(['passing', passingIcon, '#35A15E'], 'green');
-    this.failing = this.createStateDecoration(['failing', failingIcon, '#D6443C'], 'red');
-    this.skip = this.createStateDecoration(['skip', skipIcon, '#fed37f'], 'yellow');
-    this.unknown = this.createStateDecoration(['unknown', unknownIcon, '#8C8C8C'], 'darkgrey');
+    this.passing = this.createStateDecoration([['passing', passingIcon, '#35A15E'], 'green']);
+    this.failing = this.createStateDecoration([['failing', failingIcon, '#D6443C'], 'red']);
+    this.skip = this.createStateDecoration([['skip', skipIcon, '#fed37f'], 'yellow']);
+    this.unknown = this.createStateDecoration(
+      [['unknown', unknownIcon, '#BBBBBB'], 'darkgrey'],
+      [['unknown-light', unknownIcon, '#555555']]
+    );
   }
 
   private resolvePath(...args: string[]): string {
@@ -55,16 +59,35 @@ export class Decorations {
   }
 
   private createStateDecoration(
-    icon: Parameters<Decorations['prepareIcon']>,
-    overviewRulerColor: string
+    dark: /* default */ [Parameters<Decorations['prepareIcon']>, string?],
+    light?: /* optional overrides */ [Parameters<Decorations['prepareIcon']>, string?]
   ): TextEditorDecorationType {
-    return window.createTextEditorDecorationType({
-      overviewRulerColor,
-      gutterIconPath: this.prepareIcon(...icon),
+    const [iconOptions, overviewRulerColor] = dark;
+    const icon = this.prepareIcon(...iconOptions);
+
+    const options: DecorationRenderOptions = {
+      gutterIconPath: icon,
       gutterIconSize: 'contain',
       overviewRulerLane: OverviewRulerLane.Left,
       rangeBehavior: DecorationRangeBehavior.ClosedClosed,
-    });
+      dark: {
+        gutterIconPath: icon,
+      },
+      light: {
+        gutterIconPath: light !== undefined ? this.prepareIcon(...light[0]) : icon,
+      },
+    };
+
+    if (overviewRulerColor) {
+      options['overviewRulerColor'] = overviewRulerColor;
+      options['dark']['overviewRulerColor'] = overviewRulerColor;
+    }
+
+    if (light !== undefined && light[1] !== undefined) {
+      options['light']['overviewRulerColor'] = light[1];
+    }
+
+    return window.createTextEditorDecorationType(options);
   }
 
   public failingAssertionStyle(text: string): TextEditorDecorationType {
