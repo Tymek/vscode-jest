@@ -1,14 +1,16 @@
 module.exports = {
   preset: 'ts-jest',
-  globals: {
-    'ts-jest': {
-      // ts-jest configuration goes here
-      tsconfig: 'tests/tsconfig.json',
-    },
+  transform: {
+    '^.+\\.tsx?$': [
+      'ts-jest',
+      {
+        tsconfig: 'tests/tsconfig.json',
+      },
+    ],
   },
   testEnvironment: 'node',
   testRegex: 'tests/.*\\.test\\.ts$',
-  collectCoverageFrom: ['src/**/*.ts'],
+  coveragePathIgnorePatterns: ['/node_modules/', '/tests/'],
   automock: true,
   moduleFileExtensions: ['ts', 'js', 'json'],
   unmockedModulePathPatterns: [
@@ -20,6 +22,8 @@ module.exports = {
     'core-js',
     'debug',
     '@babel/template',
+    'graceful-fs',
+    '@babel/types',
   ],
   moduleNameMapper: {
     '\\.(svg)$': '<rootDir>/tests/fileMock.ts',

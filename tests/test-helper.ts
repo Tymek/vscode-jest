@@ -1,11 +1,19 @@
 /* istanbul ignore file */
-import { Location, LocationRange, TestResult } from '../src/TestResults/TestResult';
-import { TestReconciliationStateType } from '../src/TestResults';
-import { ItBlock, TestAssertionStatus } from 'jest-editor-support';
+import { LocationRange, TestResult } from '../src/TestResults/TestResult';
+import {
+  CodeLocation as Location,
+  ItBlock,
+  TestAssertionStatus,
+  TestReconciliationState,
+} from 'jest-editor-support';
 import { JestProcessRequest } from '../src/JestProcessManagement';
 import { JestTestProcessType } from '../src/Settings';
-import { AutoRunAccessor } from '../src/JestExt';
 import { MatchEvent } from '../src/TestResults/match-node';
+import * as path from 'path';
+import { RunMode } from '../src/JestExt/run-mode';
+
+// hack: redefine hasLocation so we don't need to unmock match-by-context just for this function
+const hasLocation = (loc: any): loc is LocationRange => loc.start != null && loc.end != null;
 
 export const EmptyLocation = {
   line: 0,
@@ -19,7 +27,7 @@ export const makeLocation = (pos: [number, number]): Location => ({
   line: pos[0],
   column: pos[1],
 });
-export const makePositionRange = (pos: [number, number, number, number]) => ({
+export const makePositionRange = (pos: [number, number, number, number]): any => ({
   start: makeLocation([pos[0], pos[1]]),
   end: makeLocation([pos[2], pos[3]]),
 });
@@ -33,17 +41,30 @@ export const makeZeroBased = (r: LocationRange): LocationRange => ({
   end: { line: r.end.line - 1, column: r.end.column - 1 },
 });
 export const findResultForTest = (results: TestResult[], itBlock: ItBlock): TestResult[] => {
+  if (!hasLocation(itBlock)) {
+    return [];
+  }
   const zeroBasedRange = makeZeroBased(itBlock);
   return results.filter((r) => r.name === itBlock.name && isSameLocationRange(r, zeroBasedRange));
 };
 
 // factory method
+export const makeSnapshotBlock = (marker?: string, isInline?: boolean, line?: number): any => {
+  const loc = line ? makePositionRange([line, 0, line, 0]) : EmptyLocationRange;
+  return {
+    marker,
+    isInline: isInline ?? false,
+    node: { name: 'node', loc },
+    parents: [],
+  };
+};
+
 export const makeItBlock = (
   name?: string,
   pos?: [number, number, number, number],
   override?: Partial<ItBlock>
 ): any => {
-  const loc = pos ? makePositionRange(pos) : EmptyLocationRange;
+  const loc = pos ? makePositionRange(pos) : {};
   return {
     type: 'it',
     name,
@@ -68,7 +89,7 @@ export const makeRoot = (children: any[]): any => ({
 });
 export const makeAssertion = (
   title: string,
-  status: TestReconciliationStateType,
+  status: TestReconciliationState,
   ancestorTitles: string[] = [],
   location?: [number, number],
   override?: Partial<TestAssertionStatus>
@@ -78,13 +99,13 @@ export const makeAssertion = (
     ancestorTitles,
     fullName: [...ancestorTitles, title].join(' '),
     status,
-    location: location ? makeLocation(location) : EmptyLocation,
+    location: location ? makeLocation(location) : null,
     ...(override || {}),
-  } as TestAssertionStatus);
+  }) as TestAssertionStatus;
 
 export const makeTestResult = (
   title: string,
-  status: TestReconciliationStateType,
+  status: TestReconciliationState,
   ancestorTitles: string[] = [],
   range?: [number, number, number, number],
   override?: Partial<TestResult>
@@ -134,9 +155,9 @@ export const mockProjectWorkspace = (...args: any[]): any => {
   };
 };
 
-export const mockWworkspaceLogging = (): any => ({ create: () => jest.fn() });
+export const mockWorkspaceLogging = (): any => ({ create: () => jest.fn() });
 
-export const mockEvent = () => ({
+export const mockEvent = (): any => ({
   event: jest.fn().mockReturnValue({ dispose: jest.fn() }),
   fire: jest.fn(),
   dispose: jest.fn(),
@@ -145,15 +166,16 @@ export const mockJestExtEvents: any = () => ({
   onRunEvent: mockEvent(),
   onTestSessionStarted: mockEvent(),
   onTestSessionStopped: mockEvent(),
+  onTestDataAvailable: mockEvent(),
 });
 
-export const mockJestExtContext = (autoRun?: AutoRunAccessor): any => {
+export const mockJestExtContext = (runMode?: RunMode): any => {
+  const baseSettings = { shell: { toSetting: jest.fn() } };
   return {
     workspace: jest.fn(),
-    runnerWorkspace: jest.fn(),
-    settings: jest.fn(),
+    createRunnerWorkspace: jest.fn(),
+    settings: runMode ? { ...baseSettings, runMode } : baseSettings,
     loggingFactory: { create: jest.fn(() => jest.fn()) },
-    autoRun: autoRun ?? jest.fn(),
     events: mockJestExtEvents(),
   };
 };
@@ -167,7 +189,7 @@ export const mockJestProcessContext = (): any => {
 };
 
 // custom matcher to test matchResults
-type ResultRecord = [string, number, TestReconciliationStateType, MatchEvent[]];
+type ResultRecord = [string, number, TestReconciliationState, MatchEvent[]];
 const allHistory = (m: TestResult) => [...m.sourceHistory, ...(m.assertionHistory ?? [])];
 export const toTestResultRecord = (m: TestResult): ResultRecord => [
   m.name,
@@ -213,6 +235,15 @@ expect.extend({
       };
     }
   },
+});
+
+export const makeWorkspaceFolder = (name: string): any => ({
+  uri: makeUri(name),
+  name,
+});
+export const makeUri = (...parts: string[]): any => ({
+  fsPath: parts.join(path.sep),
+  path: parts.join('/'),
 });
 
 declare global {

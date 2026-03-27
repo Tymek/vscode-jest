@@ -4,10 +4,11 @@
     "module": "commonjs",
     "moduleResolution": "node",
     "noUnusedLocals": true,
+    "allowSyntheticDefaultImports": true,
     "noUnusedParameters": true,
     "target": "es6",
     "outDir": "out",
-    "lib": ["es6", "es7", "es2020"],
+    "lib": ["es6", "es7", "es2020", "es2021"],
     "sourceMap": true,
     "rootDir": ".",
     "plugins": [

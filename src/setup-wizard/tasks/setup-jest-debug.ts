@@ -1,57 +1,42 @@
+/**
+ * generate a debug config and update the launch.json for users to edit
+ */
 import * as vscode from 'vscode';
 
 import {
-  showActionMessage,
   showActionMenu,
-  mergeDebugConfigWithCmdLine,
-  jsonOut,
-  actionItem,
   getWizardSettings,
   createSaveConfig,
+  selectWorkspaceFolder,
 } from '../wizard-helper';
-import {
-  WizardStatus,
-  ActionableMenuItem,
-  WizardContext,
-  SetupTask,
-  WIZARD_HELP_URL,
-} from '../types';
+import { WizardStatus, SetupTask, WizardContext } from '../types';
 import { setupJestCmdLine } from './setup-jest-cmdline';
+import { getValidJestCommand } from '../../helpers';
+import { enabledWorkspaceFolders } from '../../workspace-manager';
 
 export const DEBUG_CONFIG_NAME = 'vscode-jest-tests';
 
 export const DebugSetupActionId = {
-  acceptExisting: 0,
-  edit: 1,
-  info: 2,
-  create: 3,
-  replace: 4,
-  setupJestCmdLine: 5,
+  generate: 0,
+  setupJestCommand: 1,
+  setupJestCommandButton: 2,
 };
 
+type SetupMode = 'generate' | 'done';
 export const setupJestDebug: SetupTask = async (context: WizardContext): Promise<WizardStatus> => {
-  const { workspace, message, debugConfigProvider } = context;
-  const saveConfig = createSaveConfig(context);
-  const settings = getWizardSettings(workspace);
-
-  // check prerequsite
-  if (!settings.jestCommandLine) {
-    const msg = 'Missing required "jest.jestCommandLine" setting...';
-    message(msg);
-    const result = await showActionMessage('error', msg, {
-      id: DebugSetupActionId.setupJestCmdLine,
-      title: 'Setup jestCommandLine',
-      action: () => setupJestCmdLine(context),
-    });
-    if (result === 'success') {
-      return setupJestDebug(context);
-    }
+  const { workspace: _ws, message, debugConfigProvider } = context;
+  const workspace = _ws ?? (await selectWorkspaceFolder(enabledWorkspaceFolders()));
+  if (!workspace) {
     return 'abort';
   }
-  const jestCommandLine = settings.jestCommandLine;
+  context.workspace = workspace;
+
+  let mode: SetupMode;
+
+  const saveConfig = createSaveConfig(context);
+  const settings = getWizardSettings(workspace);
   const launchConfigs = settings.configurations;
 
-  // save config to workspaceFolder launch.json file
   const save = async (config: vscode.DebugConfiguration): Promise<string | undefined> => {
     let renamed;
     const configs =
@@ -69,18 +54,26 @@ export const setupJestDebug: SetupTask = async (context: WizardContext): Promise
     });
 
     if (renamed) {
-      message(`existing "${DEBUG_CONFIG_NAME}" config has been renamed to "${renamed}"`);
+      message(`existing "${config.name}" config has been renamed to "${renamed}"`);
     }
-    message(`a new debug config "${DEBUG_CONFIG_NAME}" has been added in launch.json`);
+    message(`a new debug config "${config.name}" has been added in launch.json`);
     return renamed;
   };
 
   // open launch.json and position to the jest debug config
-  const edit = async (): Promise<WizardStatus> => {
+  const showConfig = async (): Promise<WizardStatus> => {
     const launchFile = vscode.Uri.joinPath(workspace.uri, '.vscode', 'launch.json');
     const doc = await vscode.workspace.openTextDocument(launchFile);
     const text = doc.getText();
-    const offset = text.indexOf(`"${DEBUG_CONFIG_NAME}"`);
+    const { sorted } = debugConfigProvider.getDebugConfigNames(workspace);
+    let offset = -1;
+    for (const name of sorted) {
+      offset = text.indexOf(name);
+      if (offset > 0) {
+        break;
+      }
+    }
+
     const startPos = doc.positionAt(offset);
     const endPos = new vscode.Position(
       startPos.line,
@@ -92,106 +85,82 @@ export const setupJestDebug: SetupTask = async (context: WizardContext): Promise
     return 'success';
   };
 
-  const updateConfigWithCmdline = async (
-    config: vscode.DebugConfiguration
-  ): Promise<WizardStatus> => {
-    const finalConfig = mergeDebugConfigWithCmdLine(
-      config,
-      jestCommandLine,
-      settings.absoluteRootPath
-    );
-
-    message(
-      `debug config has been updated with jestCommandLine=${settings.jestCommandLine}:\n${jsonOut(
-        finalConfig
-      )}`
-    );
-
-    const renamed = await save(finalConfig);
-
-    return showActionMessage(
-      'info',
-      `${renamed ? `The existing config has been renamed to "${renamed}".\n` : ''}` +
-        `A new debug config "${DEBUG_CONFIG_NAME}" has been added in launch.json.\n\n` +
-        'Please review and update as needed.',
-      {
-        id: DebugSetupActionId.info,
-        title: 'Ok',
-        isCloseAffordance: true,
-        action: () => edit(),
-      }
-    );
-  };
-
-  const generateConfig = (): Promise<WizardStatus> => {
-    const configs = debugConfigProvider.provideDebugConfigurations?.(workspace);
-    const config = Array.isArray(configs) && configs.find((c) => c.name === DEBUG_CONFIG_NAME);
-    if (!config) {
-      console.error(`no ${DEBUG_CONFIG_NAME} is generated: configs=`, configs);
-      throw new Error(`no ${DEBUG_CONFIG_NAME} is generated`);
+  const setupJestCommand = async (): Promise<WizardStatus> => {
+    const result = await setupJestCmdLine(context);
+    if (result === 'success') {
+      return setupJestDebug(context);
     }
-    return updateConfigWithCmdline(config);
+    return 'abort';
   };
 
-  const withoutExistingConfig = async (): Promise<WizardStatus> => {
-    message(`no debug config with name "${DEBUG_CONFIG_NAME}" was found`);
-    const menuItems: ActionableMenuItem[] = [
-      actionItem(
-        DebugSetupActionId.create,
-        '$(add) Generate',
-        'generate a jest debug config from jestCommandLine',
-        () => {
-          message(
-            `Generate a jest debug config from the current settings such as jestCommandLine, rootPath.\n\tPlease note, this is a best effort, i.e. manual post-adjustment might be needed\n\tIf encountered any issue, please check out ${WIZARD_HELP_URL}#note-4\n`
-          );
-          return generateConfig();
-        }
-      ),
-    ];
-    return await showActionMenu(menuItems, {
-      title: 'Set up Debug Config',
-      enableBackButton: true,
-      placeholder: 'No existing jest debug config found',
-      verbose: context.verbose,
+  const generate = async (): Promise<WizardStatus> => {
+    // check prerequisite
+    let jestCommandLine = settings.jestCommandLine;
+    let rootPath = settings.rootPath;
+
+    if (!jestCommandLine) {
+      const validSettings = (await getValidJestCommand(workspace, context.wsManager, rootPath))
+        .validSettings;
+
+      if (validSettings.length === 1) {
+        ({ jestCommandLine, rootPath } = validSettings[0]);
+      } else {
+        message('No valid jest command found. Redirecting to jest command setup...', 'warn');
+        return setupJestCommand();
+      }
+    }
+
+    const debugConfig = debugConfigProvider.createDebugConfig(workspace, {
+      jestCommandLine,
+      rootPath,
+      nodeEnv: settings.nodeEnv,
     });
-  };
-  const withExistingConfig = async (): Promise<WizardStatus> => {
-    message(`found existing setting:\n${jsonOut(settings)}\n`);
+    message('generated a debug config with jestCommandLine and rootPath:', 'info');
+    message(`${JSON.stringify(debugConfig, undefined, '  ')}`, 'new-line');
 
-    const menuItems: ActionableMenuItem[] = [
-      actionItem(
-        DebugSetupActionId.acceptExisting,
-        '$(check) Use current',
-        'aceept then current debug config without change',
-        () => {
-          message('jest debug config did not change');
-          return Promise.resolve('success');
-        }
-      ),
-      actionItem(
-        DebugSetupActionId.replace,
-        '$(refresh) Replace',
-        `rename the existing config and generate a new one...`,
-        () => generateConfig()
-      ),
-      actionItem(
-        DebugSetupActionId.edit,
-        '$(edit) Manual update',
-        `Manually edit the debug config...`,
-        () => edit()
-      ),
-    ];
-    return await showActionMenu(menuItems, {
-      title: 'Set up Debug Config',
+    await save(debugConfig);
+    await showConfig();
+
+    message('please review and edit the launch.json accordingly', 'new-line');
+    mode = 'done';
+    return 'success';
+  };
+
+  const showMenu = async (): Promise<WizardStatus> => {
+    const menuItems = [];
+    switch (mode) {
+      case 'generate': {
+        menuItems.push({
+          id: DebugSetupActionId.generate,
+          label: 'generate a debug config',
+          detail: 'update launch.json with the new debug config',
+          action: generate,
+        });
+        break;
+      }
+      case 'done': {
+        menuItems.push({
+          id: DebugSetupActionId.generate,
+          label: 'debug config generated.',
+          detail: 'please review and adjust if needed.',
+          description: '$(pass-filled)',
+        });
+        break;
+      }
+    }
+    const menuStatus = await showActionMenu<WizardStatus>(menuItems, {
+      title: `[${workspace.name}] Set up Debug Config`,
+      placeholder: 'generating debug config with jestCommandLine and rootPath',
       enableBackButton: true,
-      placeholder: `Found existing debug config: "${DEBUG_CONFIG_NAME}"`,
       verbose: context.verbose,
+      allowNoAction: true,
     });
+    if (menuStatus !== 'success') {
+      return menuStatus;
+    }
+    return showMenu();
   };
 
-  message(`Set up jest debug config for workspace "${workspace.name}"`, 'setupJestDebug');
-
-  const jestDebug = launchConfigs?.find((c) => c.name === DEBUG_CONFIG_NAME);
-
-  return jestDebug ? await withExistingConfig() : await withoutExistingConfig();
+  mode = 'generate';
+  return showMenu();
 };

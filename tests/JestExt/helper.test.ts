@@ -1,104 +1,127 @@
 jest.unmock('../../src/JestExt/helper');
+jest.unmock('../../src/JestExt/run-mode');
+jest.unmock('../../src/virtual-workspace-folder');
 jest.unmock('../test-helper');
+
+const mockPlatform = jest.fn();
+const mockUserInfo = jest.fn();
+jest.mock('os', () => ({ platform: mockPlatform, userInfo: mockUserInfo }));
+
 import * as vscode from 'vscode';
 import { readFileSync } from 'fs';
 import {
+  collectCoverage,
   createJestExtContext,
   getExtensionResourceSettings,
   isWatchRequest,
+  outputFileSuffix,
+  prefixWorkspace,
 } from '../../src/JestExt/helper';
+import { RunMode } from '../../src/JestExt/run-mode';
 import { ProjectWorkspace } from 'jest-editor-support';
 import { workspaceLogging } from '../../src/logging';
-import { pathToJest, pathToConfig } from '../../src/helpers';
-import { mockProjectWorkspace } from '../test-helper';
-import { toFilePath } from '../../src/helpers';
+import { makeWorkspaceFolder, mockProjectWorkspace } from '../test-helper';
+
+import { toFilePath, toAbsoluteRootPath } from '../../src/helpers';
+import { RunnerWorkspaceOptions } from '../../src/JestExt/types';
+import { RunShell } from '../../src/JestExt/run-shell';
+import { createJestSettingGetter } from '../../src/Settings';
+
+jest.mock('jest-editor-support', () => ({ isLoginShell: jest.fn(), ProjectWorkspace: jest.fn() }));
 
 describe('createJestExtContext', () => {
-  const workspaceFolder: any = { name: 'workspace' };
-  describe('autoRun', () => {
-    it.each`
-      pluginSettings                                     | expectedConfig
-      ${{ autoEnable: false }}                           | ${'off'}
-      ${{ autoEnable: true, runAllTestsFirst: true }}    | ${{ watch: true, onStartup: ['all-tests'] }}
-      ${{ autoEnable: true, runAllTestsFirst: false }}   | ${{ watch: true }}
-      ${{ autoEnable: true, autoRun: { watch: false } }} | ${{ watch: false }}
-    `('can create autoRun from current settings', ({ pluginSettings, expectedConfig }) => {
-      const { autoRun } = createJestExtContext(workspaceFolder, pluginSettings);
-      expect(autoRun.config).toEqual(expectedConfig);
-    });
-    it.each`
-      autoRunConfig                                | mode
-      ${'off'}                                     | ${'auto-run-off'}
-      ${{ watch: true }}                           | ${'auto-run-watch'}
-      ${{ watch: false }}                          | ${'auto-run-off'}
-      ${{ watch: false, onSave: undefined }}       | ${'auto-run-off'}
-      ${{ watch: false, onSave: 'test-file' }}     | ${'auto-run-on-save-test'}
-      ${{ watch: false, onSave: 'test-src-file' }} | ${'auto-run-on-save'}
-    `('$autoRunConfig => $mode', ({ autoRunConfig, mode }) => {
-      const settings: any = { autoRun: autoRunConfig };
-      const { autoRun } = createJestExtContext(workspaceFolder, settings);
-      expect(autoRun.mode).toEqual(mode);
-    });
-    it.each`
-      autoRunConfig                                                      | accessor
-      ${'off'}                                                           | ${{ isOff: true }}
-      ${{ watch: true }}                                                 | ${{ isOff: false, isWatch: true }}
-      ${{ watch: true, onStartup: ['all-tests'] }}                       | ${{ isOff: false, isWatch: true, onStartup: ['all-tests'] }}
-      ${{ watch: false, onStartup: ['all-tests'] }}                      | ${{ isOff: false, isWatch: false, onStartup: ['all-tests'] }}
-      ${{ watch: false, onStartup: ['all-tests'], onSave: 'test-file' }} | ${{ isOff: false, isWatch: false, onStartup: ['all-tests'], onSave: 'test-file' }}
-      ${{ watch: false, onSave: 'test-src-file' }}                       | ${{ isOff: false, isWatch: false, onSave: 'test-src-file' }}
-    `('isOff', ({ autoRunConfig, accessor }) => {
-      const settings: any = { autoRun: autoRunConfig };
-      const { autoRun } = createJestExtContext(workspaceFolder, settings);
-      expect(autoRun.isOff).toEqual(accessor.isOff);
-      expect(autoRun.isWatch).toEqual(accessor.isWatch ?? false);
-      expect(autoRun.onStartup).toEqual(accessor.onStartup);
-      expect(autoRun.onSave).toEqual(accessor.onSave);
-      expect(autoRun.config).toEqual(autoRunConfig);
-    });
-    describe('jestCommandSettings', () => {
-      beforeEach(() => {
-        (ProjectWorkspace as jest.Mocked<any>).mockImplementation(mockProjectWorkspace);
-        (pathToJest as jest.Mocked<any>).mockReturnValue('path-to-jest');
-        (pathToConfig as jest.Mocked<any>).mockReturnValue('path-to-config');
-      });
-      it('without jestCommandLine, returns pathToJest and pathToConfig', () => {
-        const settings: any = {
-          pathToJest: 'abc',
-          pathToConfig: 'whatever',
-          rootPath: '',
-        };
-        const { runnerWorkspace } = createJestExtContext(workspaceFolder, settings);
-        expect(runnerWorkspace.jestCommandLine).toEqual('path-to-jest');
-        expect(runnerWorkspace.pathToConfig).toEqual('path-to-config');
-      });
-      it('with jestCommandLine, ignore both pathToJest and pathToConfig', () => {
-        const settings: any = {
-          jestCommandLine: 'jest --coverage',
-          pathToJest: 'abc',
-          pathToConfig: 'whatever',
-        };
-        const { runnerWorkspace } = createJestExtContext(workspaceFolder, settings);
-        expect(runnerWorkspace.jestCommandLine).toEqual(settings.jestCommandLine);
-        expect(runnerWorkspace.pathToConfig).toEqual('');
-      });
-    });
+  beforeAll(() => {
+    console.error = jest.fn();
+    console.warn = jest.fn();
   });
-  it('will create runnerWorkspace', () => {
-    const rootPath = 'abc';
-    const settings: any = { rootPath };
-    const mockRunnerWorkspace = { rootPath };
-    (ProjectWorkspace as jest.Mocked<any>).mockReturnValue(mockRunnerWorkspace);
-    const context = createJestExtContext(workspaceFolder, settings);
-    expect(ProjectWorkspace).toBeCalled();
-    expect(toFilePath).toBeCalledWith(rootPath);
-    expect(context.runnerWorkspace).toEqual(mockRunnerWorkspace);
+  const baseSettings = {
+    runMode: new RunMode('watch'),
+    shell: { toSetting: jest.fn() },
+    jestCommandLine: 'jest',
+  };
+  const workspaceFolder: any = { name: 'workspace' };
+  const output: any = jest.fn();
+
+  describe('runnerWorkspace', () => {
+    it('will return runnerWorkspace factory method', () => {
+      const rootPath = 'abc';
+      const settings: any = { ...baseSettings, rootPath };
+
+      jest.clearAllMocks();
+      const mockRunnerWorkspace = { rootPath };
+      (ProjectWorkspace as jest.Mocked<any>).mockReturnValue(mockRunnerWorkspace);
+
+      const context = createJestExtContext(workspaceFolder, settings, output);
+      expect(typeof context.createRunnerWorkspace).toEqual('function');
+      expect(ProjectWorkspace).not.toHaveBeenCalled();
+
+      const runnerWorkspace = context.createRunnerWorkspace();
+      expect(ProjectWorkspace).toHaveBeenCalled();
+      expect(toFilePath).toHaveBeenCalledWith(rootPath);
+      expect(runnerWorkspace).toEqual(mockRunnerWorkspace);
+    });
+    it('will pass through useDashedArgs', () => {
+      const settings: any = { ...baseSettings, useDashedArgs: true };
+
+      jest.clearAllMocks();
+
+      const { createRunnerWorkspace } = createJestExtContext(workspaceFolder, settings, output);
+      createRunnerWorkspace();
+      const args = (ProjectWorkspace as jest.Mocked<any>).mock.calls[0];
+      const [useDashedArgs] = [args[9]];
+      expect(useDashedArgs).toBeTruthy();
+    });
+    describe('allow creating runnerWorkspace with custom options', () => {
+      it('outputFileSuffix and collectCoverage', () => {
+        const settings: any = { ...baseSettings, showCoverageOnLoad: false };
+
+        jest.clearAllMocks();
+
+        const { createRunnerWorkspace } = createJestExtContext(workspaceFolder, settings, output);
+
+        let options: RunnerWorkspaceOptions = { outputFileSuffix: 'extra' };
+        createRunnerWorkspace(options);
+        let args = (ProjectWorkspace as jest.Mocked<any>).mock.calls[0];
+        let [outputFileSuffix, collectCoverage] = [args[4], args[5]];
+
+        expect(outputFileSuffix.endsWith('extra')).toBeTruthy();
+        expect(collectCoverage).toBeFalsy();
+
+        options = { collectCoverage: true };
+        createRunnerWorkspace(options);
+        args = (ProjectWorkspace as jest.Mocked<any>).mock.calls[1];
+        [outputFileSuffix, collectCoverage] = [args[4], args[5]];
+        expect(collectCoverage).toEqual(true);
+      });
+    });
+    describe('construct outputFileSuffix', () => {
+      it.each`
+        case | uInfo                                  | extra           | expected
+        ${1} | ${{ uid: 123, username: 'user1' }}     | ${undefined}    | ${'123'}
+        ${2} | ${{ uid: 0, username: 'user1' }}       | ${undefined}    | ${'0'}
+        ${3} | ${{ uid: 123, username: 'user1' }}     | ${'extra'}      | ${'123_extra'}
+        ${4} | ${{ uid: -1, username: 'john smith' }} | ${'extra'}      | ${'john_smith_extra'}
+        ${5} | ${{ uid: -1, username: 'a**name' }}    | ${'with space'} | ${'a__name_with_space'}
+      `('case $case', ({ uInfo, extra, expected }) => {
+        mockUserInfo.mockReturnValue(uInfo);
+        const ws = 'a';
+        expect(outputFileSuffix(ws, extra)).toEqual(`${ws}_${expected}`);
+      });
+    });
+    it('if no jestCommandLine defined, throw exception', () => {
+      jest.clearAllMocks();
+      (ProjectWorkspace as jest.Mocked<any>).mockImplementation(mockProjectWorkspace);
+
+      const settings: any = { ...baseSettings, jestCommandLine: '' };
+      const context = createJestExtContext(workspaceFolder, settings, output);
+      expect(() => context.createRunnerWorkspace()).toThrow();
+    });
   });
   it('will create logging factory', () => {
-    const settings: any = {};
+    const settings: any = { ...baseSettings };
     (workspaceLogging as jest.Mocked<any>).mockReturnValue({});
-    const context = createJestExtContext(workspaceFolder, settings);
-    expect(workspaceLogging).toBeCalled();
+    const context = createJestExtContext(workspaceFolder, settings, output);
+    expect(workspaceLogging).toHaveBeenCalled();
     expect(context.loggingFactory).toEqual({});
   });
 });
@@ -118,40 +141,112 @@ describe('isWatchRequest', () => {
 });
 
 describe('getExtensionResourceSettings()', () => {
+  let userSettings: any;
+  let mockShell: any;
   beforeEach(() => {
-    vscode.workspace.getConfiguration = jest.fn().mockImplementation((section) => {
+    userSettings = {};
+    (toAbsoluteRootPath as jest.Mocked<any>).mockImplementation(
+      jest.requireActual('../../src/helpers').toAbsoluteRootPath
+    );
+    (createJestSettingGetter as jest.Mocked<any>).mockImplementation(() => {
       const data = readFileSync('./package.json');
       const config = JSON.parse(data.toString()).contributes.configuration.properties;
 
       const defaults = {};
       for (const key of Object.keys(config)) {
-        if (section.length === 0 || key.startsWith(`${section}.`)) {
+        if (key.startsWith('jest')) {
           defaults[key] = config[key].default;
         }
       }
-
-      return {
-        get: jest.fn().mockImplementation((key) => defaults[`${section}.${key}`]),
-      };
+      return jest.fn().mockImplementation((key) => userSettings[key] ?? defaults[`jest.${key}`]);
     });
+    mockShell = jest.fn();
+    (RunShell as jest.Mocked<any>).mockImplementation(() => mockShell);
   });
   it('should return the extension resource configuration', async () => {
-    const uri: any = { fsPath: 'workspaceFolder1' };
-    expect(getExtensionResourceSettings(uri)).toEqual({
-      autoEnable: true,
+    const folder = makeWorkspaceFolder('workspaceFolder1');
+    expect(getExtensionResourceSettings(folder)).toEqual({
       coverageFormatter: 'DefaultFormatter',
-      enableSnapshotUpdateMessages: true,
-      pathToConfig: '',
-      pathToJest: null,
       jestCommandLine: undefined,
-      restartJestOnSnapshotUpdate: false,
       rootPath: 'workspaceFolder1',
-      runAllTestsFirst: true,
-      showCoverageOnLoad: false,
       debugMode: false,
       coverageColors: null,
-      autoRun: null,
-      testExplorer: { enabled: true },
+      runMode: expect.objectContaining({ config: { type: 'watch' } }),
+      monitorLongRun: 60000,
+      shell: mockShell,
+      parserPluginOptions: null,
+      enable: true,
+      nodeEnv: undefined,
+      useDashedArgs: false,
+      useJest30: null,
     });
+    expect(createJestSettingGetter).toHaveBeenCalledWith(folder);
+  });
+
+  it('with nodeEnv and shell path', () => {
+    userSettings = {
+      nodeEnv: { whatever: '1' },
+      shell: mockShell,
+    };
+    const folder = makeWorkspaceFolder('workspaceFolder1');
+    const settings = getExtensionResourceSettings(folder);
+    expect(settings).toEqual(
+      expect.objectContaining({
+        ...userSettings,
+      })
+    );
+  });
+
+  describe('runMode', () => {
+    it('pass along legacy settings', () => {
+      userSettings = {
+        showCoverageOnLoad: true,
+        autoRun: 'off',
+        testExplorer: { showInlineError: true },
+      };
+      const folder = makeWorkspaceFolder('workspaceFolder1');
+      const settings = getExtensionResourceSettings(folder);
+      expect(settings.runMode.config).toEqual({
+        type: 'on-demand',
+        coverage: true,
+        showInlineError: true,
+      });
+    });
+    it('if there is runMode, it will ignore the legacy settings', () => {
+      userSettings = {
+        showCoverageOnLoad: true,
+        autoRun: 'off',
+        runMode: 'on-save',
+      };
+      const folder = makeWorkspaceFolder('workspaceFolder1');
+      const settings = getExtensionResourceSettings(folder);
+      expect(settings.runMode.config).toEqual({
+        type: 'on-save',
+      });
+    });
+  });
+});
+describe('prefixWorkspace', () => {
+  const context: any = { workspace: { name: 'ws' } };
+  it('will not prefix if not multi-root', () => {
+    (vscode.workspace as any).workspaceFolders = [{}];
+    expect(prefixWorkspace(context, 'a message')).toEqual('a message');
+  });
+  it('prefix workspace name for multi-root workspace message', () => {
+    (vscode.workspace as any).workspaceFolders = [{}, {}];
+    expect(prefixWorkspace(context, 'a message')).toEqual('(ws) a message');
+  });
+});
+
+describe('collectCoverage', () => {
+  it.each`
+    case | coverage     | settings                                        | expected
+    ${1} | ${undefined} | ${undefined}                                    | ${false}
+    ${2} | ${true}      | ${{ runMode: { config: { coverage: false } } }} | ${true}
+    ${3} | ${false}     | ${{ runMode: { config: { coverage: true } } }}  | ${false}
+    ${4} | ${undefined} | ${{ runMode: { config: { coverage: true } } }}  | ${true}
+    ${5} | ${undefined} | ${{ runMode: { config: { coverage: false } } }} | ${false}
+  `('case $case', ({ coverage, settings, expected }) => {
+    expect(collectCoverage(coverage, settings)).toEqual(expected);
   });
 });

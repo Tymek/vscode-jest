@@ -22,31 +22,28 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         with:
-          node-version: 14.x
+          node-version: 18.x
           cache: yarn
 
       - name: Validate cache
         run: yarn --immutable
 
-  lint-danger-typecheck:
-    name: Running TypeScript compiler & ESLint
+  lint-typecheck:
+    name: Pre-test checks
     runs-on: ubuntu-latest
     needs: prepare-yarn-cache
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         with:
-          node-version: 14.x
+          node-version: 18.x
           cache: yarn
       - name: install
         run: yarn --immutable
-      - name: Danger
-        run: yarn danger ci
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: run tsc
         run: yarn tsc
       - name: run eslint
@@ -56,7 +53,7 @@ jobs:
     name: Testing on ${{ matrix.os }} with Node v${{ matrix.node-version }} 
     strategy:
       matrix:
-        node-version: [14.x, 16.x]
+        node-version: [18.x, 20.x]
         os: [ubuntu-latest, macOS-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     needs: prepare-yarn-cache
@@ -64,7 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: yarn
@@ -84,9 +81,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         with:
-          node-version: 14.x
+          node-version: 18.x
           cache: yarn
       - name: install
         run: yarn --immutable

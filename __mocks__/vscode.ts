@@ -8,6 +8,7 @@ const StatusBarAlignment = { Left: 1, Right: 2 };
 const window = {
   createStatusBarItem: jest.fn(() => ({
     show: jest.fn(),
+    hide: jest.fn(),
     tooltip: jest.fn(),
   })),
   showErrorMessage: jest.fn(),
@@ -15,8 +16,14 @@ const window = {
   createTextEditorDecorationType: jest.fn(),
   createOutputChannel: jest.fn(),
   showWorkspaceFolderPick: jest.fn(),
+  showQuickPick: jest.fn(),
   onDidChangeActiveTextEditor: jest.fn(),
   showInformationMessage: jest.fn(),
+  createWebviewPanel: jest.fn(),
+};
+
+const extensions = {
+  getExtension: jest.fn(),
 };
 
 const workspace = {
@@ -63,7 +70,6 @@ const commands = {
   registerTextEditorCommand: jest.fn(),
 };
 
-// eslint-disable-next-line @typescript-eslint/no-empty-function
 const CodeLens = function CodeLens() {};
 
 const QuickInputButtons = {
@@ -79,9 +85,14 @@ const TestRunProfileKind = {
   Debug: 2,
   Coverage: 3,
 };
+const ViewColumn = {
+  One: 1,
+  Tow: 2,
+};
 
 const TestMessage = jest.fn();
 const TestRunRequest = jest.fn();
+const ThemeColor = jest.fn();
 
 const EventEmitter = jest.fn().mockImplementation(() => {
   return {
@@ -89,7 +100,21 @@ const EventEmitter = jest.fn().mockImplementation(() => {
   };
 });
 
+const QuickPickItemKind = {
+  Separator: -1,
+  Default: 0,
+};
+
+// for coverage
+const FileCoverage = jest.fn();
+const StatementCoverage = jest.fn();
+const BranchCoverage = jest.fn();
+const DeclarationCoverage = jest.fn();
+const TestCoverageCount = jest.fn();
+
 export = {
+  extensions,
+  ThemeColor,
   CodeLens,
   languages,
   StatusBarAlignment,
@@ -112,4 +137,11 @@ export = {
   EventEmitter,
   TestMessage,
   TestRunRequest,
+  ViewColumn,
+  QuickPickItemKind,
+  FileCoverage,
+  StatementCoverage,
+  BranchCoverage,
+  DeclarationCoverage,
+  TestCoverageCount,
 };

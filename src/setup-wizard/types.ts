@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
+import { DebugConfigurationProvider, DebugConfigOptions } from '../DebugConfigurationProvider';
+import { JestExtOutput } from '../JestExt/output-terminal';
+import { WorkspaceManager } from '../workspace-manager';
 
 export interface WizardContext {
-  debugConfigProvider: vscode.DebugConfigurationProvider;
-  workspace: vscode.WorkspaceFolder;
-
-  message: (msg: string, section?: string) => void;
+  debugConfigProvider: DebugConfigurationProvider;
+  wsManager: WorkspaceManager;
+  vscodeContext: vscode.ExtensionContext;
+  workspace?: vscode.WorkspaceFolder;
+  message: JestExtOutput['write'];
   verbose?: boolean;
 }
 
@@ -12,13 +16,13 @@ export type WizardStatus = 'success' | 'error' | 'abort' | 'exit' | undefined;
 export type WizardAction<T> = () => Promise<T>;
 interface ActionableComp<T> {
   id: number;
-  action: WizardAction<T>;
+  action?: WizardAction<T>;
 }
 export type ActionableMenuItem<T = WizardStatus> = vscode.QuickPickItem & ActionableComp<T>;
 export type ActionableButton<T = WizardStatus> = vscode.QuickInputButton & ActionableComp<T>;
 export type ActionableMessageItem<T> = vscode.MessageItem & ActionableComp<T>;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/explicit-module-boundary-types
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const isActionableButton = (arg: any): arg is ActionableButton<unknown> =>
   arg && arg.iconPath && typeof arg.action === 'function';
 
@@ -36,6 +40,8 @@ export interface ActionMenuOptions<T = WizardStatus> extends AllowBackButton, Ve
   value?: string;
   rightButtons?: ActionableButton<T>[];
   selectItemIdx?: number;
+  // if true, treat action item/button without action as no-op; otherwise exit with "undefined"
+  allowNoAction?: boolean;
 }
 
 // actionable input box
@@ -51,14 +57,10 @@ export interface ActionInputBoxOptions<T> extends AllowBackButton, Verbose {
 export type SetupTask = (context: WizardContext) => Promise<WizardStatus>;
 
 // settings
-export const JestSettings = ['pathToJest', 'pathToConfig', 'jestCommandLine', 'rootPath'];
-type JestSettingKey = typeof JestSettings[number];
-
-// prettier-ignore
-export type WizardSettings = 
-  { [key in JestSettingKey]?: string } & 
-  { ['configurations']?: vscode.DebugConfiguration[] } & 
-  { ['absoluteRootPath']?: string };
+export interface WizardSettings extends DebugConfigOptions {
+  absoluteRootPath?: string;
+  configurations?: vscode.DebugConfiguration[];
+}
 
 export interface ConfigEntry {
   name: string;

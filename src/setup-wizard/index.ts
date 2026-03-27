@@ -1,1 +1,9 @@
-export { startWizard, StartWizardOptions, WizardTaskId } from './start-wizard';
+export {
+  startWizard,
+  StartWizardOptions,
+  WizardTaskId,
+  PendingSetupTask,
+  PendingSetupTaskKey,
+} from './start-wizard';
+
+export { IgnoreWorkspaceChanges } from './tasks';

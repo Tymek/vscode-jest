@@ -30,12 +30,12 @@ export const isRequestEqual = (r1: JestProcessRequest, r2: JestProcessRequest): 
   }
 };
 
-export const isDup = (task: Task<JestProcess>, request: JestProcessRequest): boolean => {
+export const isDupe = (task: Task<JestProcess>, request: JestProcessRequest): boolean => {
   const process = task.data;
-  if (!request.schedule.dedup) {
+  if (!request.schedule.dedupe) {
     return false;
   }
-  const predicate: TaskPredicate = request.schedule.dedup;
+  const predicate: TaskPredicate = request.schedule.dedupe;
 
   if (predicate.filterByStatus && !predicate.filterByStatus.includes(task.status)) {
     return false;
@@ -46,9 +46,10 @@ export const isDup = (task: Task<JestProcess>, request: JestProcessRequest): boo
   return true;
 };
 
+const skipAttrs = ['listener', 'run'];
 export const requestString = (request: JestProcessRequest): string => {
   const replacer = (key: string, value: unknown) => {
-    if (key === 'listener') {
+    if (skipAttrs.includes(key)) {
       return typeof value;
     }
     return value;

@@ -14,11 +14,11 @@ import {
   TestAssertionStatus,
   ParsedNode,
   DescribeBlock,
-  Location,
+  CodeLocation as Location,
   NamedBlock,
+  ParsedNodeType,
 } from 'jest-editor-support';
-import { TestReconciliationState } from './TestReconciliationState';
-import { TestResult } from './TestResult';
+import { TestResult, TestStatus, LocationRange } from './TestResult';
 import {
   DataNode,
   ContainerNode,
@@ -31,6 +31,14 @@ import {
   MatchOptions,
 } from './match-node';
 
+interface MaybeWithLocation {
+  start?: Location;
+  end?: Location;
+}
+
+export const hasLocation = (loc: MaybeWithLocation): loc is LocationRange =>
+  loc.start != null && loc.end != null;
+
 export const buildAssertionContainer = (
   assertions: TestAssertionStatus[]
 ): ContainerNode<TestAssertionStatus> => {
@@ -39,7 +47,7 @@ export const buildAssertionContainer = (
     assertions.forEach((a) => {
       const container = root.findContainer(
         a.ancestorTitles,
-        (name: string) => new ContainerNode(name, { isGroup: 'maybe' })
+        (name: string) => new ContainerNode(name, undefined, { isGroup: 'maybe' })
       );
       // regardless the document: https://jestjs.io/docs/26.x/cli#--testlocationinresults
       // the location are actually zero-based, but the "line" attribute is 1-based.
@@ -70,17 +78,21 @@ export const buildSourceContainer = (sourceRoot: ParsedNode): ContainerNode<ItBl
     let container = parent;
     const attrs = (namedNode: NamedBlock): OptionalAttributes => ({
       isGroup: namedNode.lastProperty === 'each' ? 'yes' : 'no',
-      nonLiteralName: namedNode.nameType !== 'Literal',
+      // TODO: we could probably remove the checking for 'Literal' after a while. This was probably produced by the older version of the babel-parser
+      nonLiteralName: !(
+        namedNode.nameType && ['StringLiteral', 'Literal'].includes(namedNode.nameType)
+      ),
       range: {
         start: namedNode.start ? adjustLocation(namedNode.start) : UnknownRange.start,
         end: namedNode.end ? adjustLocation(namedNode.end) : UnknownRange.end,
       },
     });
+    const start = (node.start?.line ?? 0) - 1;
     if (isDescribeBlock(node)) {
-      container = new ContainerNode(node.name, attrs(node));
+      container = new ContainerNode(node.name, start, attrs(node));
       parent.addContainerNode(container);
     } else if (isItBlock(node)) {
-      parent.addDataNode(new DataNode(node.name, node.start.line - 1, node, attrs(node)));
+      parent.addDataNode(new DataNode(node.name, start, node, attrs(node)));
     }
 
     node.children?.forEach((n) => buildNode(n, container));
@@ -97,8 +109,14 @@ export const buildSourceContainer = (sourceRoot: ParsedNode): ContainerNode<ItBl
   return root;
 };
 
-const adjustLocation = (l: Location): Location => ({ column: l.column - 1, line: l.line - 1 });
+const adjustLocation = (l?: Location): Location => ({
+  column: l ? l.column - 1 : 0,
+  line: l ? l.line - 1 : 0,
+});
 const matchPos = (t: ItBlock, a: TestAssertionStatus, forError = false): boolean => {
+  if (!hasLocation(t)) {
+    return false;
+  }
   const line = forError ? a.line : a.line ?? a.location?.line;
   return (line != null && line >= t.start.line && line <= t.end.line) || false;
 };
@@ -121,7 +139,11 @@ export const toMatchResult = (
       ? [undefined, undefined, assertionOrErr]
       : [assertionOrErr.data, assertionOrErr.history(reason), undefined];
 
+  if (!test.start || !test.end) {
+    console.warn(`missing location for test block: ${test.name}`);
+  }
   // Note the shift from one-based to zero-based line number and columns
+  // assumption: if we reached here, the test start/end must have been defined
   return {
     name: assertion?.fullName ?? assertion?.title ?? sourceName,
     identifier: {
@@ -130,11 +152,15 @@ export const toMatchResult = (
     },
     start: adjustLocation(test.start),
     end: adjustLocation(test.end),
-    status: assertion?.status ?? TestReconciliationState.Unknown,
+    status: assertion?.status ?? TestStatus.Unknown,
     shortMessage: assertion?.shortMessage ?? err,
     terseMessage: assertion?.terseMessage,
     lineNumberOfError:
-      assertion?.line && matchPos(test, assertion, true) ? assertion.line - 1 : test.end.line - 1,
+      assertion?.line && matchPos(test, assertion, true)
+        ? assertion.line - 1
+        : test.end
+          ? test.end.line - 1
+          : 0,
     sourceHistory,
     assertionHistory,
   };
@@ -148,22 +174,24 @@ type MessagingInfo = {
   aContainer: ContainerNode<TestAssertionStatus>;
 };
 
-const createMessaging = (fileName: string, _verbose: boolean) => (info: MessagingInfo): void => {
-  const build = (msg: string): Parameters<typeof console.log> => [
-    `[test resut matching] ${info.type} : ${msg} : "${fileName}"\n`,
-    info,
-  ];
-  switch (info.type) {
-    case 'report-unmatched':
-      console.warn(...build(`${info.unmatchedItBlocks.length} unmatched test blocks`));
-      break;
-  }
-};
+const createMessaging =
+  (fileName: string, _verbose: boolean) =>
+  (info: MessagingInfo): void => {
+    const build = (msg: string): Parameters<typeof console.log> => [
+      `[test result matching] ${info.type} : ${msg} : "${fileName}"\n`,
+      info,
+    ];
+    switch (info.type) {
+      case 'report-unmatched':
+        console.warn(...build(`${info.unmatchedItBlocks.length} unmatched test blocks`));
+        break;
+    }
+  };
 
 type MatchResultType<C extends ContextType> = [
   ChildNodeType<ItBlock, C>,
   ChildNodeType<TestAssertionStatus, C>[],
-  MatchEvent
+  MatchEvent,
 ];
 interface ContextMatchAlgorithm {
   match: (
@@ -195,6 +223,7 @@ const ContextMatch = (): ContextMatchAlgorithm => {
     tNode.addEvent(event);
     aNode.addEvent(event);
     aNode.attrs.range = tNode.attrs.range;
+    aNode.attrs.snapshot = tNode.attrs.snapshot;
   };
   const onMatchResult = (
     tNode: DataNode<ItBlock>,
@@ -450,14 +479,18 @@ const ContextMatch = (): ContextMatchAlgorithm => {
  */
 
 const { match } = ContextMatch();
+const isParsedNode = (source: ParsedNode | ContainerNode<ItBlock>): source is ParsedNode =>
+  typeof source === 'object' &&
+  'type' in source &&
+  Object.values(ParsedNodeType).includes(source.type);
 
 export const matchTestAssertions = (
   fileName: string,
-  sourceRoot: ParsedNode,
+  source: ParsedNode | ContainerNode<ItBlock>,
   assertions: TestAssertionStatus[] | ContainerNode<TestAssertionStatus>,
   verbose = false
 ): TestResult[] => {
-  const tContainer = buildSourceContainer(sourceRoot);
+  const tContainer = isParsedNode(source) ? buildSourceContainer(source) : source;
   const aContainer = Array.isArray(assertions) ? buildAssertionContainer(assertions) : assertions;
 
   const messaging = createMessaging(fileName, verbose);

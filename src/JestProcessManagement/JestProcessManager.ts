@@ -1,33 +1,43 @@
 import { JestProcess } from './JestProcess';
-import { TaskArrayFunctions, JestProcessRequest, QueueType, Task, JestProcessInfo } from './types';
+import {
+  TaskArrayFunctions,
+  JestProcessRequest,
+  QueueType,
+  Task,
+  JestProcessInfo,
+  UserDataType,
+  ProcessStatus,
+} from './types';
 import { Logging } from '../logging';
 import { createTaskQueue, TaskQueue } from './task-queue';
-import { isDup, requestString } from './helper';
-import { JestExtContext } from '../JestExt';
+import { isDupe, requestString } from './helper';
+import { JestExtProcessContext } from '../JestExt';
 
 export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
-  private extContext: JestExtContext;
-  private blockingQueue: TaskQueue<JestProcess>;
-  private nonBlockingQueue: TaskQueue<JestProcess>;
+  private extContext: JestExtProcessContext;
+  private queues: Map<QueueType, TaskQueue<JestProcess>>;
   private logging: Logging;
 
-  constructor(extContext: JestExtContext) {
+  constructor(extContext: JestExtProcessContext) {
     this.extContext = extContext;
     this.logging = extContext.loggingFactory.create('JestProcessManager');
-    this.blockingQueue = createTaskQueue('blocking-queue', 1);
-    this.nonBlockingQueue = createTaskQueue('non-blocking-queue', 3);
+    this.queues = new Map([
+      ['blocking', createTaskQueue('blocking-queue', 1)],
+      ['blocking-2', createTaskQueue('blocking-queue-2', 1)],
+      ['non-blocking', createTaskQueue('non-blocking-queue', 3)],
+    ]);
   }
 
   private getQueue(type: QueueType): TaskQueue<JestProcess> {
-    return type === 'blocking' ? this.blockingQueue : this.nonBlockingQueue;
+    return this.queues.get(type)!;
   }
 
   private foundDup(request: JestProcessRequest): boolean {
-    if (!request.schedule.dedup) {
+    if (!request.schedule.dedupe) {
       return false;
     }
     const queue = this.getQueue(request.schedule.queue);
-    const dupTasks = queue.filter((p) => isDup(p, request));
+    const dupTasks = queue.filter((p) => isDupe(p, request));
     if (dupTasks.length > 0) {
       this.logging(
         'debug',
@@ -39,11 +49,14 @@ export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
     return false;
   }
   /**
-   * schedule a jest process and handle duplication process if dedup is requested.
+   * schedule a jest process and handle duplication process if dedupe is requested.
    * @param request
    * @returns a jest process id if successfully scheduled, otherwise undefined
    */
-  public scheduleJestProcess(request: JestProcessRequest): JestProcessInfo | undefined {
+  public scheduleJestProcess(
+    request: JestProcessRequest,
+    userData?: UserDataType
+  ): JestProcessInfo | undefined {
     if (this.foundDup(request)) {
       this.logging(
         'debug',
@@ -53,7 +66,7 @@ export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
     }
 
     const queue = this.getQueue(request.schedule.queue);
-    const process = new JestProcess(this.extContext, request);
+    const process = new JestProcess(this.extContext, request, userData);
     queue.add(process);
     this.run(queue);
     return process;
@@ -66,13 +79,20 @@ export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
       return;
     }
     const process = task.data;
-
     try {
-      this.logging('debug', 'starting process:', process);
-      await process.start();
-      this.logging('debug', 'process ended:', process);
+      // process could be cancelled before it starts, so check before starting
+      if (process.status === ProcessStatus.Pending) {
+        const promise = process.start();
+        this.extContext.onRunEvent.fire({ type: 'process-start', process });
+        await promise;
+      }
     } catch (e) {
-      this.logging('error', `${queue.name}: process failed:`, process, e);
+      this.logging('error', `${queue.name}: process failed to start:`, process, e);
+      this.extContext.onRunEvent.fire({
+        type: 'exit',
+        process,
+        error: `Process failed to start: ${e}`,
+      });
     } finally {
       queue.remove(task);
     }
@@ -83,8 +103,7 @@ export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
   public async stopAll(queueType?: QueueType): Promise<void> {
     let promises: Promise<void>[];
     if (!queueType) {
-      const queueTypes: QueueType[] = ['blocking', 'non-blocking'];
-      promises = queueTypes.map((q: QueueType) => this.stopAll(q));
+      promises = Array.from(this.queues.keys()).map((q) => this.stopAll(q));
     } else {
       const queue = this.getQueue(queueType);
       promises = queue.map((t) => t.data.stop());
@@ -98,14 +117,15 @@ export class JestProcessManager implements TaskArrayFunctions<JestProcess> {
     if (queueType) {
       return this.getQueue(queueType).size();
     }
-    return this.numberOfProcesses('blocking') + this.numberOfProcesses('non-blocking');
+    return Array.from(this.queues.values()).reduce((pCount, q) => {
+      pCount += q.size();
+      return pCount;
+    }, 0);
   }
 
   // task array functions
   private getQueues(queueType?: QueueType): TaskQueue<JestProcess>[] {
-    return queueType
-      ? [this.getQueue(queueType)]
-      : [this.getQueue('blocking'), this.getQueue('non-blocking')];
+    return queueType ? [this.getQueue(queueType)] : Array.from(this.queues.values());
   }
   public map<M>(f: (task: Task<JestProcess>) => M, queueType?: QueueType): M[] {
     const queues = this.getQueues(queueType);

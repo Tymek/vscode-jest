@@ -1,11 +1,13 @@
+import * as vscode from 'vscode';
 import { platform } from 'os';
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
-import { normalize, join } from 'path';
+import { join, resolve, normalize, isAbsolute } from 'path';
 import { ExtensionContext } from 'vscode';
 
-import { PluginResourceSettings, hasUserSetPathToJest } from './Settings';
 import { TestIdentifier } from './TestResults';
-import { TestStats } from './types';
+import { StringPattern, TestStats } from './types';
+import { LoginShell } from 'jest-editor-support';
+import { WorkspaceManager } from './workspace-manager';
 
 /**
  * Known binary names of `react-scripts` forks
@@ -28,9 +30,7 @@ export const nodeBinExtension: string = platform() === 'win32' ? '.cmd' : '';
  * Returns the path if it exists, or `undefined` otherwise
  */
 function getLocalPathForExecutable(rootPath: string, executable: string): string | undefined {
-  const absolutePath = normalize(
-    join(rootPath, 'node_modules', '.bin', executable + nodeBinExtension)
-  );
+  const absolutePath = resolve(rootPath, 'node_modules', '.bin', executable + nodeBinExtension);
   return existsSync(absolutePath) ? absolutePath : undefined;
 }
 
@@ -38,17 +38,20 @@ function getLocalPathForExecutable(rootPath: string, executable: string): string
  * Tries to read the test command from the scripts section within `package.json`
  *
  * Returns the test command in case of success,
- * `undefined` if there was an exception while reading and parsing `package.json`
- * `null` if there is no test script
+ * `undefined` otherwise
  */
-export function getTestCommand(rootPath: string): string | undefined | null {
+export function getTestCommand(rootPath: string): string | undefined {
+  const packageJSON = getPackageJson(rootPath);
+  if (packageJSON && packageJSON.scripts && packageJSON.scripts.test) {
+    return packageJSON.scripts.test;
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getPackageJson(rootPath: string): any | undefined {
   try {
-    const packagePath = join(rootPath, 'package.json');
-    const packageJSON = JSON.parse(readFileSync(packagePath, 'utf8'));
-    if (packageJSON && packageJSON.scripts && packageJSON.scripts.test) {
-      return packageJSON.scripts.test;
-    }
-    return null;
+    const packagePath = resolve(rootPath, 'package.json');
+    return JSON.parse(readFileSync(packagePath, 'utf8'));
   } catch {
     return undefined;
   }
@@ -63,59 +66,97 @@ export function isCreateReactAppTestCommand(testCommand?: string | null): boolea
     createReactAppBinaryNames.some((binary) => testCommand.includes(`${binary} test`))
   );
 }
+export function hasReactBinary(rootPath: string): boolean {
+  return createReactAppBinaryNames.some((binary) => getLocalPathForExecutable(rootPath, binary));
+}
 
-/**
- * Checks if the project in `rootPath` was bootstrapped by `create-react-app`.
- */
-function isBootstrappedWithCreateReactApp(rootPath: string): boolean {
+function checkPackageTestScript(rootPath: string): string | undefined {
   const testCommand = getTestCommand(rootPath);
-  if (testCommand === undefined) {
-    // In case parsing `package.json` failed or was unconclusive,
-    // fallback to checking for the presence of the binaries in `./node_modules/.bin`
-    return createReactAppBinaryNames.some(
-      (binary) => getLocalPathForExecutable(rootPath, binary) !== undefined
-    );
+  if (!testCommand) {
+    return;
   }
-  return isCreateReactAppTestCommand(testCommand);
+  if (
+    isCreateReactAppTestCommand(testCommand) ||
+    testCommand.includes('jest') ||
+    // for react apps, even if we don't recognize the test script pattern, still better to use the test script
+    // than running the binary with hard coded parameters ourselves.
+    hasReactBinary(rootPath)
+  ) {
+    const pm = getPM(rootPath) ?? 'npm';
+    if (pm === 'npm') {
+      return 'npm test --';
+    }
+    return 'yarn test';
+  }
+}
+
+const PMInfo: Record<string, string> = {
+  yarn: 'yarn.lock',
+  npm: 'package-lock.json',
+};
+function getPM(rootPath: string): string | undefined {
+  return Object.keys(PMInfo).find((pm) => {
+    const lockFile = PMInfo[pm];
+    const absolutePath = resolve(rootPath, lockFile);
+    return existsSync(absolutePath);
+  });
 }
 
 /**
- * Handles getting the jest runner, handling the OS and project specific work too
+ * construct a default jest command from rootPath, currently support any configurations that match any of the following:
+ * 1. a "test" script in package.json that contains CRA or "jest" command
+ * 2. a jest binary in local node_modules
+ * 3. CRA scripts in local node_modules.
  *
- * @returns {string}
+ * @param rootPath an absolute path from where the search starts.
+ * @returns the verified jest command for jest or CRA apps, if found; otherwise return undefined
  */
-// tslint:disable-next-line no-shadowed-variable
-export function pathToJest({ pathToJest, rootPath }: PluginResourceSettings): string {
-  if (pathToJest && hasUserSetPathToJest(pathToJest)) {
-    return normalize(pathToJest);
+export const getDefaultJestCommand = (rootPath = ''): string | undefined => {
+  const _rootPath = resolve(rootPath);
+  const pmScript = checkPackageTestScript(_rootPath);
+  if (pmScript) {
+    return pmScript;
   }
 
-  if (isBootstrappedWithCreateReactApp(rootPath)) {
-    return 'npm test --';
+  const cmd = getLocalPathForExecutable(rootPath, 'jest');
+  if (cmd) {
+    return `"${cmd}"`;
   }
-
-  const p = getLocalPathForExecutable(rootPath, 'jest') || 'jest' + nodeBinExtension;
-  return `"${p}"`;
-}
+};
 
 /**
- * Handles getting the path to config file
+ * Escapes special characters in a string to be used as a regular expression pattern.
+ * If the provided value is already a regex (indicated by `isRegExp`), it is returned unmodified.
  *
- * @returns {string}
+ * [2025.04.14] Additionally, the function can replace actual newline characters with the literal sequence `\n`.
+ * This behavior is enabled by default (via `replaceNewLine = true`) to ensure that
+ * the regex pattern can be safely passed as a single command line argument—for example,
+ * for options like "--testPathPattern" or "testNamePattern". Even for regex usage, modifying
+ * newlines in this way can help prevent issues with multi-line arguments that might otherwise
+ * break in shell contexts.
+ *
+ * @param {string | StringPattern} str - The string or object to escape. When an object is provided,
+ *   it must have a `value` property containing the string, and can optionally include:
+ *   - `isRegExp`: if true, the function assumes the string is already a valid regex and returns it as-is.
+ *   - `exactMatch`: if true, the resulting escaped string is anchored with '^' at the start and '$' at the end.
+ * @param {boolean} [replaceNewLine=true] - Whether to replace newline characters with the literal
+ *   sequence "\n". This is beneficial when the result is used as a command line argument, even though
+ *   it alters the actual newline characters that might be expected in some regex patterns.
+ *
+ * @returns {string} The escaped string, suitable for use as a regex pattern and for passing as a shell argument.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
  */
-export function pathToConfig(pluginSettings: PluginResourceSettings): string {
-  if (pluginSettings.pathToConfig) {
-    return normalize(pluginSettings.pathToConfig);
+export function escapeRegExp(str: string | StringPattern, replaceNewLine = true): string {
+  const sp: StringPattern = typeof str === 'string' ? { value: str } : str;
+  let value: string;
+  if (sp.isRegExp) {
+    value = sp.value;
+  } else {
+    const escaped = sp.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+    value = sp.exactMatch ? escaped + '$' : escaped;
   }
-
-  return '';
-}
-
-/**
- *  Taken From https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
- */
-export function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+  return replaceNewLine ? value.replace(/\r\n|\r|\n/g, '\\n') : value;
 }
 
 /**
@@ -203,11 +244,159 @@ export function prepareIconFile(
   return resultIconPath;
 }
 
-const SurroundingQuoteRegex = /^["']+|["']+$/g;
+const SurroundingQuoteRegex = /^["']|["']$/g;
 export const removeSurroundingQuote = (command: string): string =>
   command.replace(SurroundingQuoteRegex, '');
 
 // TestStats
+/* istanbul ignore next */
 export const emptyTestStats = (): TestStats => {
   return { success: 0, fail: 0, unknown: 0 };
+};
+
+export const escapeQuotes = (str: string): string => str.replace(/(['"])/g, '\\$1');
+
+const getShellPath = (shell?: string | LoginShell): string | undefined => {
+  if (!shell) {
+    return;
+  }
+  if (typeof shell === 'string') {
+    return shell;
+  }
+  return shell.path;
+};
+/**
+ * quoting a given string for it to be used as shell command arguments.
+ *
+ * Note: the logic is based on vscode's debug argument handling:
+ * https://github.com/microsoft/vscode/blob/c0001d7becf437944f5898a7c9485922d60dd8d3/src/vs/workbench/contrib/debug/node/terminals.ts#L82
+ * However, had to modify a few places for windows platform.
+ *
+ * updated 10/22/2022 based on https://github.com/microsoft/vscode/blob/d1f38520db76f0e80e3cdcbb35b95651afe802ae/src/vs/workbench/contrib/debug/node/terminals.ts#L60
+ *
+ **/
+
+export const shellQuote = (str: string, shell?: string | LoginShell): string => {
+  const targetShell = getShellPath(shell)?.trim().toLowerCase();
+
+  // try to determine the shell type
+  let shellType: 'powershell' | 'cmd' | 'sh';
+  if (!targetShell) {
+    shellType = platform() === 'win32' ? 'cmd' : 'sh';
+  } else if (targetShell.indexOf('powershell') >= 0 || targetShell.indexOf('pwsh') >= 0) {
+    shellType = 'powershell';
+  } else if (targetShell.indexOf('cmd.exe') >= 0) {
+    shellType = 'cmd';
+  } else {
+    shellType = 'sh';
+  }
+
+  switch (shellType) {
+    case 'powershell': {
+      const s = str.replace(/(['"])/g, '$1$1');
+      return s.endsWith('\\') ? `'${s}'\\` : `'${s}'`;
+    }
+
+    case 'cmd': {
+      // Escape double quotes by doubling them and always quote the string
+      // no need to escape special cmd characters (such as ><!^&|) within the quoted string
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+
+    default: {
+      //'sh'
+      const s = str.replace(/(["'\\$!><#()[\]*&^| ;{}`])/g, '\\$1');
+      return s.length === 0 ? `""` : s;
+    }
+  }
+};
+
+export const toErrorString = (e: unknown): string => {
+  if (e == null) {
+    return '';
+  }
+  if (typeof e === 'string') {
+    return e;
+  }
+  if (e instanceof Error) {
+    return e.stack ?? e.toString();
+  }
+  return JSON.stringify(e);
+};
+
+// regex that match single, double quotes and "\" escape char"
+const cmdSplitRegex = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s'"]+)/g;
+export const parseCmdLine = (cmdLine: string): string[] => {
+  const parts = cmdLine.match(cmdSplitRegex) || [];
+  // clean up command
+  if (parts.length > 0 && parts[0]) {
+    parts[0] = normalize(removeSurroundingQuote(parts[0]));
+  }
+  return parts;
+};
+
+/**
+ * Converts a relative or absolute root path to an absolute root path based on the provided workspace folder.
+ * If no root path is provided, returns the absolute path of the workspace folder.
+ * @param workspace The workspace folder to use as a base for the absolute root path.
+ * @param rootPath The relative or absolute root path to convert to an absolute root path.
+ * @returns The absolute root path.
+ */
+export const toAbsoluteRootPath = (
+  workspace: vscode.WorkspaceFolder,
+  rootPath?: string
+): string => {
+  if (!rootPath) {
+    return workspace.uri.fsPath;
+  }
+  return isAbsolute(rootPath) ? normalize(rootPath) : resolve(workspace.uri.fsPath, rootPath);
+};
+
+export interface JestCommandSettings {
+  rootPath: string;
+  jestCommandLine: string;
+}
+export interface JestCommandResult {
+  uris?: vscode.Uri[];
+  validSettings: JestCommandSettings[];
+}
+
+/**
+ * generate a valid jest command settings beyond the static "defaultJestCommand" by doing a deep search from the workspace-root/rootPath down
+ * @param workspace
+ * @param workspaceManager
+ * @param rootPath
+ * @returns
+ */
+export const getValidJestCommand = async (
+  workspace: vscode.WorkspaceFolder,
+  workspaceManager: WorkspaceManager,
+  rootPath?: string
+): Promise<JestCommandResult> => {
+  const absoluteRootPath = toAbsoluteRootPath(workspace, rootPath);
+  let jestCommandLine = getDefaultJestCommand(absoluteRootPath);
+  if (jestCommandLine) {
+    return Promise.resolve({ validSettings: [{ rootPath: absoluteRootPath, jestCommandLine }] });
+  }
+
+  // see if we can get a valid command by examining the file system
+  const uris = await workspaceManager.getFoldersFromFilesystem(workspace);
+
+  const validSettings: JestCommandSettings[] = [];
+  for (const uri of uris) {
+    const p = uri.fsPath;
+    if (p === absoluteRootPath) {
+      continue;
+    }
+    jestCommandLine = getDefaultJestCommand(p);
+    if (jestCommandLine) {
+      const settings = { jestCommandLine, rootPath: p };
+      validSettings.push(settings);
+
+      if (validSettings.length > 1) {
+        break;
+      }
+    }
+  }
+  return { uris, validSettings };
 };

@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/explicit-module-boundary-types */
 import * as vscode from 'vscode';
 import { mockJestExtEvents } from '../test-helper';
+import { RunMode } from '../../src/JestExt/run-mode';
 
 export class TestItemCollectionMock {
   constructor(public parent?: vscode.TestItem) {}
@@ -27,10 +27,9 @@ export class TestItemCollectionMock {
 export const mockExtExplorerContext = (wsName = 'ws-1', override: any = {}): any => {
   return {
     loggingFactory: { create: jest.fn().mockReturnValue(jest.fn()) },
-    autoRun: {},
     session: { scheduleProcess: jest.fn() },
     workspace: { name: wsName, uri: { fsPath: `/${wsName}` } },
-    testResolveProvider: {
+    testResultProvider: {
       events: {
         testListUpdated: { event: jest.fn().mockReturnValue({ dispose: jest.fn() }) },
         testSuiteChanged: { event: jest.fn().mockReturnValue({ dispose: jest.fn() }) },
@@ -38,9 +37,12 @@ export const mockExtExplorerContext = (wsName = 'ws-1', override: any = {}): any
       getTestList: jest.fn().mockReturnValue([]),
       isTestFile: jest.fn().mockReturnValue('yes'),
       getTestSuiteResult: jest.fn().mockReturnValue({}),
+      previewSnapshot: jest.fn(),
     },
     debugTests: jest.fn(),
     sessionEvents: mockJestExtEvents(),
+    settings: { testExplorer: { enabled: true }, runMode: new RunMode() },
+    output: { write: jest.fn(), dispose: jest.fn(), clear: jest.fn() },
     ...override,
   };
 };
@@ -56,6 +58,10 @@ export const mockRun = (request?: any, name?: any): any => ({
   enqueued: jest.fn(),
   appendOutput: jest.fn(),
   end: jest.fn(),
+  cancel: jest.fn(),
+  write: jest.fn(),
+  addProcess: jest.fn(),
+  updateRequest: jest.fn(),
   token: { onCancellationRequested: jest.fn() },
 });
 export const mockController = (): any => {
@@ -69,17 +75,34 @@ export const mockController = (): any => {
       return run;
     }),
     dispose: jest.fn(),
-    createRunProfile: jest.fn(),
+    createRunProfile: jest.fn().mockImplementation((label, kind, runHandler, isDefault, tag) => ({
+      label,
+      kind,
+      runHandler,
+      isDefault,
+      tag,
+    })),
     createTestItem: jest.fn().mockImplementation((id, label, uri) => {
       const item: any = {
         id,
         label,
         uri,
         errored: jest.fn(),
+        tags: [],
       };
       item.children = new TestItemCollectionMock(item);
       return item;
     }),
     items: new TestItemCollectionMock(),
+  };
+};
+
+export const mockJestProcess = (id: string, extra?: any): any => {
+  return {
+    id,
+    start: jest.fn(),
+    stop: jest.fn(),
+    status: 'pending',
+    ...(extra ?? {}),
   };
 };

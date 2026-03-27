@@ -1,15 +1,39 @@
+import * as vscode from 'vscode';
 import { RunnerEvent } from 'jest-editor-support';
 import { JestTestProcessType } from '../Settings';
 import { JestProcess } from './JestProcess';
+import { JestTestRun } from '../test-provider/jest-test-run';
+import { TestNamePattern } from '../types';
 
-export type JestProcessEvent = RunnerEvent | 'processStarting';
 export interface JestProcessListener {
-  onEvent: (process: JestProcess, event: JestProcessEvent, ...args: unknown[]) => unknown;
+  onEvent: (process: JestProcess, event: RunnerEvent, ...args: unknown[]) => unknown;
 }
-export type JestProcessStatus = 'pending' | 'running' | 'stopping' | 'stoppped';
+export type JestProcessStatus = 'pending' | 'running' | 'stopping' | 'stopped';
+export interface UserDataType {
+  run?: JestTestRun;
+  execError?: boolean;
+  testError?: boolean;
+  testItem?: vscode.TestItem;
+}
+export enum ProcessStatus {
+  Pending = 'pending',
+  Running = 'running',
+  Cancelled = 'cancelled',
+  // process exited not because of cancellation
+  Done = 'done',
+}
+
 export interface JestProcessInfo {
   readonly id: string;
   readonly request: JestProcessRequest;
+  // user data is a way to store data that is outside of the process managed by the processManager.
+  // subsequent use of this data is up to the user but should be aware that multiple components might contribute to this data.
+  userData?: UserDataType;
+  stop: () => Promise<void>;
+  status: ProcessStatus;
+  isWatchMode: boolean;
+  // starting a timer to automatically kill the process after x milliseconds if the process is still running.
+  autoStop: (delay?: number, onStop?: (process: JestProcessInfo) => void) => void;
 }
 
 export type TaskStatus = 'running' | 'pending';
@@ -18,7 +42,7 @@ export interface Task<T> {
   status: TaskStatus;
 }
 
-export type QueueType = 'blocking' | 'non-blocking';
+export type QueueType = 'blocking' | 'blocking-2' | 'non-blocking';
 
 /**
  * predicate to match task
@@ -29,37 +53,26 @@ export interface TaskPredicate {
   filterByStatus?: TaskStatus[];
   filterByContent?: boolean;
 }
-/**
- * define the eligibility for process scheduling
- * @param queue the type of the queue
- * @param dedup a predicate to match the task in queue.
- */
-export interface ScheduleStrategy {
-  queue: QueueType;
-  dedup?: TaskPredicate;
-}
 
-interface JestProcessRequestCommon {
-  schedule: ScheduleStrategy;
-  listener: JestProcessListener;
-}
-export type JestProcessRequestBase =
+type JestProcessTestRequestBase =
   | {
       type: Extract<JestTestProcessType, 'watch-tests' | 'watch-all-tests'>;
     }
   | {
       type: Extract<JestTestProcessType, 'all-tests'>;
       updateSnapshot?: boolean;
+      nonBlocking?: boolean;
     }
   | {
       type: Extract<JestTestProcessType, 'by-file'>;
       testFileName: string;
       updateSnapshot?: boolean;
+      notTestFile?: boolean;
     }
   | {
       type: Extract<JestTestProcessType, 'by-file-test'>;
       testFileName: string;
-      testNamePattern: string;
+      testNamePattern: TestNamePattern;
       updateSnapshot?: boolean;
     }
   | {
@@ -70,14 +83,42 @@ export type JestProcessRequestBase =
   | {
       type: Extract<JestTestProcessType, 'by-file-test-pattern'>;
       testFileNamePattern: string;
-      testNamePattern: string;
+      testNamePattern: TestNamePattern;
       updateSnapshot?: boolean;
-    }
-  | {
-      type: Extract<JestTestProcessType, 'not-test'>;
-      args: string[];
     };
 
+type JestProcessTestRequestCommon = {
+  coverage?: boolean;
+};
+
+export type JestProcessTestRequestType = JestProcessTestRequestCommon & JestProcessTestRequestBase;
+
+type JestProcessNonTestRequest = {
+  type: Extract<JestTestProcessType, 'not-test'>;
+  args: string[];
+};
+
+type JestProcessRequestType = JestProcessTestRequestType | JestProcessNonTestRequest;
+
+/**
+ * define the eligibility for process scheduling
+ * @param queue the type of the queue
+ * @param dedupe a predicate to match the task in queue.
+ */
+export interface ScheduleStrategy {
+  queue: QueueType;
+  dedupe?: TaskPredicate;
+}
+
+interface JestProcessRequestCommon {
+  schedule: ScheduleStrategy;
+  listener: JestProcessListener;
+}
+export type JestProcessRequestTransform = (request: JestProcessRequest) => JestProcessRequest;
+
+export type JestProcessRequestBase = JestProcessRequestType & {
+  transform?: JestProcessRequestTransform;
+};
 export type JestProcessRequest = JestProcessRequestBase & JestProcessRequestCommon;
 
 export interface TaskArrayFunctions<T> {

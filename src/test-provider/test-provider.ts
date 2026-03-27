@@ -1,78 +1,119 @@
 import * as vscode from 'vscode';
 import { JestTestProviderContext } from './test-provider-context';
 import { WorkspaceRoot } from './test-item-data';
-import { Debuggable, JestExtExplorerContext, TestItemData } from './types';
-import { extensionId } from '../appGlobals';
+import { ItemCommand, JestExtExplorerContext, TestItemData, TestTagId } from './types';
+import { extensionId, extensionName } from '../appGlobals';
 import { Logging } from '../logging';
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const isDebuggable = (arg: any): arg is Debuggable => arg && typeof arg.getDebugInfo === 'function';
-
-export const RunProfileInfo: Record<vscode.TestRunProfileKind, string> = {
-  [vscode.TestRunProfileKind.Run]: 'run',
-  [vscode.TestRunProfileKind.Debug]: 'debug',
-  [vscode.TestRunProfileKind.Coverage]: 'run with coverage',
-};
+import { toErrorString } from '../helpers';
+import { tiContextManager } from './test-item-context-manager';
+import { JestTestRun } from './jest-test-run';
+import { JestTestCoverageProvider } from './test-coverage';
 
 export class JestTestProvider {
   private readonly controller: vscode.TestController;
   private context: JestTestProviderContext;
   private workspaceRoot: WorkspaceRoot;
   private log: Logging;
+  private coverageProvider: JestTestCoverageProvider;
 
   constructor(jestContext: JestExtExplorerContext) {
     this.log = jestContext.loggingFactory.create('JestTestProvider');
     const wsFolder = jestContext.workspace;
 
-    this.controller = this.createController(wsFolder, jestContext);
+    this.controller = this.createController(wsFolder);
 
-    this.context = new JestTestProviderContext(jestContext, this.controller);
+    this.context = new JestTestProviderContext(
+      jestContext,
+      this.controller,
+      this.createProfiles(this.controller)
+    );
     this.workspaceRoot = new WorkspaceRoot(this.context);
+    this.coverageProvider = new JestTestCoverageProvider(this.context.ext.sessionEvents);
+    this.updateMenuContext();
   }
 
-  private createController = (
-    wsFolder: vscode.WorkspaceFolder,
-    jestContext: JestExtExplorerContext
-  ): vscode.TestController => {
+  private updateMenuContext() {
+    tiContextManager.setItemContext({
+      workspace: this.context.ext.workspace,
+      key: 'jest.runMode',
+      itemIds: [this.workspaceRoot.item.id],
+    });
+    tiContextManager.setItemContext({
+      workspace: this.context.ext.workspace,
+      key: 'jest.workspaceRoot',
+      itemIds: [this.workspaceRoot.item.id],
+    });
+  }
+
+  private createController = (wsFolder: vscode.WorkspaceFolder): vscode.TestController => {
     const controller = vscode.tests.createTestController(
       `${extensionId}:TestProvider:${wsFolder.name}`,
       `Jest Test Provider (${wsFolder.name})`
     );
 
     controller.resolveHandler = this.discoverTest;
-    if (!jestContext.autoRun.isWatch) {
-      controller.createRunProfile('run', vscode.TestRunProfileKind.Run, this.runTests, true);
-    }
-    controller.createRunProfile('debug', vscode.TestRunProfileKind.Debug, this.runTests, true);
-    controller.createRunProfile(
-      'run with coverage',
-      vscode.TestRunProfileKind.Coverage,
-      this.runTests,
-      true
-    );
-
     return controller;
   };
+  private createProfiles = (controller: vscode.TestController): vscode.TestRunProfile[] => {
+    const runTag = new vscode.TestTag(TestTagId.Run);
+    const debugTag = new vscode.TestTag(TestTagId.Debug);
+    const runProfile = controller.createRunProfile(
+      'run tests',
+      vscode.TestRunProfileKind.Run,
+      this.runTests,
+      true,
+      runTag
+    );
+    runProfile.configureHandler = async () => {
+      vscode.commands.executeCommand(
+        `${extensionName}.with-workspace.change-run-mode`,
+        this.context.ext.workspace
+      );
+    };
+    const debugProfile = controller.createRunProfile(
+      'debug tests',
+      vscode.TestRunProfileKind.Debug,
+      this.runTests,
+      true,
+      debugTag
+    );
+    const coverageProfile = controller.createRunProfile(
+      'run tests with coverage',
+      vscode.TestRunProfileKind.Coverage,
+      this.runTests,
+      false,
+      runTag
+    );
+    coverageProfile.loadDetailedCoverage = this.loadDetailedCoverage;
+    return [runProfile, debugProfile, coverageProfile];
+  };
+
+  private loadDetailedCoverage = async (
+    _testRun: vscode.TestRun,
+    fileCoverage: vscode.FileCoverage
+  ): Promise<vscode.FileCoverageDetail[]> =>
+    this.coverageProvider.loadDetailedCoverage(fileCoverage);
 
   private discoverTest = (item: vscode.TestItem | undefined): void => {
     const theItem = item ?? this.workspaceRoot.item;
-    const run = this.context.createTestRun(
-      new vscode.TestRunRequest([theItem]),
-      `disoverTest: ${this.controller.id}`
-    );
-    const data = this.context.getData(theItem);
-    run.appendOutput(
-      `${
-        data ? `resolving children for ${theItem.id}\r\n` : `no data found for item ${theItem.id}`
-      }`
-    );
+    if (!theItem.canResolveChildren) {
+      return;
+    }
+    const run = this.context.createTestRun(new vscode.TestRunRequest([theItem]), {
+      name: `discoverTest: ${this.controller.id}`,
+    });
     try {
-      data?.discoverTest?.(run);
+      const data = this.context.getData(theItem);
+      if (data && data.discoverTest) {
+        data.discoverTest(run);
+      } else {
+        run.write(`no data found for item ${theItem.id}`, 'error');
+      }
     } catch (e) {
       this.log('error', `[JestTestProvider]: discoverTest error for "${theItem.id}" : `, e);
       theItem.error = `discoverTest error: ${JSON.stringify(e)}`;
     } finally {
-      run.end();
+      run.end({ reason: 'discoverTest' });
     }
   };
 
@@ -86,96 +127,86 @@ export class JestTestProvider {
    * invoke JestExt debug function for the given data, handle unexpected exception and set item state accordingly.
    * should never throw or reject.
    */
-  debugTest = async (tData: TestItemData, run: vscode.TestRun): Promise<void> => {
+  debugTest = async (tData: TestItemData, run: JestTestRun): Promise<void> => {
     let error;
-    if (isDebuggable(tData)) {
-      try {
-        const debugInfo = tData.getDebugInfo();
-        this.context.appendOutput(`launching debugger for ${tData.item.id}`, run);
-        await this.context.ext.debugTests(debugInfo.fileName, debugInfo.testNamePattern);
-        return;
-      } catch (e) {
-        error = `item ${tData.item.id} failed to debug: ${JSON.stringify(e)}`;
-      }
+    try {
+      const debugInfo = tData.getDebugInfo();
+      await this.context.ext.debugTests(debugInfo);
+      return;
+    } catch (e) {
+      error = `item ${tData.item.id} failed to debug: ${JSON.stringify(e)}`;
     }
-    error = error ?? `item ${tData.item.id} is not debuggable`;
     run.errored(tData.item, new vscode.TestMessage(error));
-    this.context.appendOutput(`${error}`, run, true, 'red');
+    run.write(error, 'error');
     return Promise.resolve();
   };
 
+  /**
+   * Runs tests for the given test run request.
+   * @param request - The test run request.
+   * @param cancelToken - Optional cancellation token.
+   * @param refreshRequest - Whether to rebuild the request based on current test tree. Defaults to false.
+   * @returns A promise that resolves when all tests have been run.
+   */
   runTests = async (
     request: vscode.TestRunRequest,
-    cancelToken: vscode.CancellationToken
+    cancelToken?: vscode.CancellationToken,
+    refreshRequest = false
   ): Promise<void> => {
-    if (!request.profile) {
-      this.log('error', 'not supporting runRequest without profile', request);
-      return Promise.reject('cnot supporting runRequest without profile');
+    if (this.context.ext.settings.runMode.config.deferred) {
+      return vscode.commands.executeCommand(
+        `${extensionName}.with-workspace.exit-defer-mode`,
+        this.context.ext.workspace,
+        { request, cancelToken }
+      );
     }
-    const profile = request.profile;
-
-    const run = this.context.createTestRun(request, this.controller.id);
-    const tests = (request.include ?? this.getAllItems()).filter(
-      (t) => !request.exclude?.includes(t)
-    );
-
-    this.context.appendOutput(
-      `executing profile: "${request.profile.label}" for ${tests.length} tests...`,
-      run
-    );
-    const notRunnable: string[] = [];
-
-    const promises: Promise<void>[] = [];
-    try {
-      for (const test of tests) {
-        const tData = this.context.getData(test);
-        if (!tData || cancelToken.isCancellationRequested) {
-          run.skipped(test);
-          continue;
-        }
-        if (!tData.canRun(profile)) {
-          run.skipped(test);
-          notRunnable.push(test.id);
-          continue;
-        }
-        if (request.profile.kind === vscode.TestRunProfileKind.Debug) {
-          await this.debugTest(tData, run);
-        } else {
-          promises.push(
-            new Promise((resolve, reject) => {
-              try {
-                tData.scheduleTest(run, resolve, profile);
-              } catch (e) {
-                const msg = `failed to schedule test for ${tData.item.id}: ${JSON.stringify(e)}`;
-                this.log('error', msg, e);
-                run.errored(test, new vscode.TestMessage(msg));
-                reject(msg);
-              }
-            })
-          );
-        }
-      }
-
-      // TODO: remove this when testItem can determine its run/debug eligibility, i.e. shows correct UI buttons.
-      // for example: we only support debugging indivisual test, when users try to debug the whole test file or folder, it will be ignored
-      // another example is to run indivisual test/test-file/folder in a watch-mode workspace is not necessary and thus will not be executed
-      if (notRunnable.length > 0) {
-        const msgs = [`the following items do not support "${request.profile.label}":`];
-        notRunnable.forEach((id) => msgs.push(id));
-        this.context.appendOutput(msgs.join('\n'), run);
-        vscode.window.showWarningMessage(msgs.join('\r\n'));
-      }
-    } catch (e) {
-      const msg = `failed to execute profile "${request.profile.label}": ${JSON.stringify(e)}`;
-      this.context.appendOutput(msg, run, true, 'red');
+    const req = refreshRequest ? this.context.requestFrom(request) : request;
+    if (!req.profile) {
+      const message = 'not supporting runRequest without profile';
+      this.log('error', message, request);
+      return Promise.reject(message);
     }
 
-    await Promise.allSettled(promises);
-    run.end();
+    const run = this.context.createTestRun(req, {
+      name: `${request.profile?.label ?? 'runTest'}: ${this.controller.id}`,
+    });
+
+    cancelToken?.onCancellationRequested(() => {
+      run.cancel();
+    });
+
+    const tests = (req.include ?? this.getAllItems()).filter((t) => !req.exclude?.includes(t));
+
+    for (const test of tests) {
+      const tData = this.context.getData(test);
+      if (!tData || cancelToken?.isCancellationRequested) {
+        run.skipped(test);
+        continue;
+      }
+      if (req.profile.kind === vscode.TestRunProfileKind.Debug) {
+        await this.debugTest(tData, run);
+      } else {
+        try {
+          tData.scheduleTest(run, { profile: request.profile });
+        } catch (e) {
+          const msg = `failed to schedule test for ${tData.item.id}: ${toErrorString(e)}`;
+          this.log('error', msg, e);
+          run.errored(test, new vscode.TestMessage(msg));
+        }
+      }
+    }
+
+    run.end({ reason: 'runTests ends' });
   };
+
+  public runItemCommand(testItem: vscode.TestItem, command: ItemCommand): void | Promise<void> {
+    const data = this.context.getData(testItem);
+    return data?.runItemCommand(command);
+  }
 
   dispose(): void {
     this.workspaceRoot.dispose();
     this.controller.dispose();
+    this.coverageProvider.dispose();
   }
 }

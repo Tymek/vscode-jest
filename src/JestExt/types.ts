@@ -2,36 +2,28 @@ import { JestTotalResults, ProjectWorkspace } from 'jest-editor-support';
 
 import * as vscode from 'vscode';
 import { LoggingFactory } from '../logging';
-import {
-  JestExtAutoRunConfig,
-  OnSaveFileType,
-  OnStartupType,
-  PluginResourceSettings,
-} from '../Settings';
-import { AutoRunMode } from '../StatusBar';
+import { PluginResourceSettings } from '../Settings';
 import { ProcessSession } from './process-session';
-import { DebugTestIdentifier } from '../DebugCodeLens';
 import { JestProcessInfo } from '../JestProcessManagement';
+import { JestOutputTerminal } from './output-terminal';
+import { TestIdentifier } from '../TestResults';
+import { DebugInfo } from '../types';
 
 export enum WatchMode {
   None = 'none',
   Watch = 'watch',
   WatchAll = 'watchAll',
 }
-export interface AutoRunAccessor {
-  config: JestExtAutoRunConfig;
-  isOff: boolean;
-  isWatch: boolean;
-  onSave: OnSaveFileType | undefined;
-  onStartup: OnStartupType | undefined;
-  mode: AutoRunMode;
+export interface RunnerWorkspaceOptions {
+  outputFileSuffix?: string;
+  collectCoverage?: boolean;
 }
 export interface JestExtContext {
   settings: PluginResourceSettings;
   workspace: vscode.WorkspaceFolder;
-  runnerWorkspace: ProjectWorkspace;
   loggingFactory: LoggingFactory;
-  autoRun: AutoRunAccessor;
+  createRunnerWorkspace: (options?: RunnerWorkspaceOptions) => ProjectWorkspace;
+  output: JestOutputTerminal;
 }
 
 export interface JestExtSessionContext extends JestExtContext {
@@ -44,14 +36,23 @@ export type JestRunEvent = RunEventBase &
   (
     | { type: 'scheduled' }
     | { type: 'data'; text: string; raw?: string; newLine?: boolean; isError?: boolean }
+    | { type: 'test-error' }
+    | { type: 'process-start' }
     | { type: 'start' }
-    | { type: 'end' }
-    | { type: 'exit'; error?: string }
+    | { type: 'end'; error?: string }
+    | { type: 'exit'; error?: string; code?: number }
+    | { type: 'long-run'; threshold: number; numTotalTestSuites?: number }
   );
+
+export interface JestTestDataAvailableEvent {
+  data: JestTotalResults;
+  process: JestProcessInfo;
+}
 export interface JestSessionEvents {
   onRunEvent: vscode.EventEmitter<JestRunEvent>;
   onTestSessionStarted: vscode.EventEmitter<JestExtSessionContext>;
   onTestSessionStopped: vscode.EventEmitter<void>;
+  onTestDataAvailable: vscode.EventEmitter<JestTestDataAvailableEvent>;
 }
 export interface JestExtProcessContextRaw extends JestExtContext {
   updateWithData: (data: JestTotalResults, process: JestProcessInfo) => void;
@@ -59,7 +60,6 @@ export interface JestExtProcessContextRaw extends JestExtContext {
 }
 export type JestExtProcessContext = Readonly<JestExtProcessContextRaw>;
 
-export type DebugFunction = (
-  document: vscode.TextDocument | string,
-  ...ids: DebugTestIdentifier[]
-) => Promise<void>;
+export type DebugTestIdentifier = string | TestIdentifier;
+
+export type DebugFunction = (debugInfo: DebugInfo) => Promise<void>;

@@ -1,123 +1,116 @@
 /**
- * collection of stateless utility functions for declutter and easy to test
+ * collection of stateless utility functions for de-clutter and easy to test
  */
 import * as vscode from 'vscode';
-import * as path from 'path';
-import { ProjectWorkspace } from 'jest-editor-support';
+import { ProjectWorkspace, LoginShell, JESParserPluginOptions } from 'jest-editor-support';
 import { JestProcessRequest } from '../JestProcessManagement';
-import { PluginResourceSettings, JestExtAutoRunConfig, TestExplorerConfig } from '../Settings';
-import { AutoRunMode } from '../StatusBar';
-import { pathToJest, pathToConfig, toFilePath } from '../helpers';
+import {
+  PluginResourceSettings,
+  TestExplorerConfig,
+  NodeEnv,
+  MonitorLongRun,
+  JestExtAutoRunSetting,
+  createJestSettingGetter,
+  JestRunModeType,
+  JestRunMode,
+  DeprecatedPluginResourceSettings,
+} from '../Settings';
 import { workspaceLogging } from '../logging';
-import { AutoRunAccessor, JestExtContext } from './types';
+import { JestExtContext, RunnerWorkspaceOptions } from './types';
 import { CoverageColors } from '../Coverage';
+import { userInfo } from 'os';
+import { JestOutputTerminal } from './output-terminal';
+import { RunMode } from './run-mode';
+import { RunShell } from './run-shell';
+import { toAbsoluteRootPath, toFilePath } from '../helpers';
 
 export const isWatchRequest = (request: JestProcessRequest): boolean =>
   request.type === 'watch-tests' || request.type === 'watch-all-tests';
 
-const autoRunMode = (autoRun: JestExtAutoRunConfig): AutoRunMode => {
-  if (autoRun === 'off') {
-    return 'auto-run-off';
+const getUserIdString = (): string => {
+  try {
+    const user = userInfo();
+    if (user.uid >= 0) {
+      return user.uid.toString();
+    }
+    if (user.username.length > 0) {
+      return user.username;
+    }
+  } catch (e) {
+    console.warn('failed to get userInfo:', e);
   }
-  if (autoRun.watch === true) {
-    return 'auto-run-watch';
-  }
-  if (autoRun.onSave === 'test-src-file') {
-    return 'auto-run-on-save';
-  }
-  if (autoRun.onSave === 'test-file') {
-    return 'auto-run-on-save-test';
-  }
-  return 'auto-run-off';
+  return 'unknown';
 };
-/**
- * create a backward compatible runMode from the the legacy settings
- */
-const getAutoRun = (pluginSettings: PluginResourceSettings): JestExtAutoRunConfig => {
-  if (pluginSettings.autoRun) {
-    return pluginSettings.autoRun;
-  }
-
-  if (!pluginSettings.autoEnable) {
-    return 'off';
-  }
-  if (pluginSettings.runAllTestsFirst) {
-    return { watch: true, onStartup: ['all-tests'] };
-  }
-
-  return { watch: true };
+export const outputFileSuffix = (ws: string, extra?: string): string => {
+  const s = `${ws}_${getUserIdString()}${extra ? `_${extra}` : ''}`;
+  // replace non-word with '_'
+  return s.replace(/\W/g, '_');
 };
-
-export const AutoRun = (pluginSettings: PluginResourceSettings): AutoRunAccessor => {
-  const config = getAutoRun(pluginSettings);
-  return {
-    config,
-    isOff: config === 'off',
-    isWatch: config !== 'off' && config.watch,
-    onSave: config !== 'off' && config.watch === false ? config.onSave : undefined,
-    onStartup: config !== 'off' ? config.onStartup : undefined,
-    mode: autoRunMode(config),
-  };
-};
-
-/**
- * This method retrieve a jest command line, if available, otherwise fall back to the legacy
- * settings for pathToJest and pathToConfig.
- *
- * @param settings
- */
-//TODO remove pathToJest and pathToConfig once we fully deprecated them
-const getJestCommandSettings = (settings: PluginResourceSettings): [string, string] => {
-  if (settings.jestCommandLine) {
-    return [settings.jestCommandLine, ''];
-  }
-  return [pathToJest(settings), pathToConfig(settings)];
-};
+export const collectCoverage = (coverage?: boolean, settings?: PluginResourceSettings) =>
+  coverage ?? settings?.runMode.config.coverage ?? false;
 
 export const createJestExtContext = (
   workspaceFolder: vscode.WorkspaceFolder,
-  settings: PluginResourceSettings
+  settings: PluginResourceSettings,
+  output: JestOutputTerminal
 ): JestExtContext => {
-  const currentJestVersion = 20;
-  const [jestCommandLine, pathToConfig] = getJestCommandSettings(settings);
-  const runnerWorkspace = new ProjectWorkspace(
-    toFilePath(settings.rootPath),
-    jestCommandLine,
-    pathToConfig,
-    currentJestVersion,
-    workspaceFolder.name,
-    settings.showCoverageOnLoad,
-    settings.debugMode
-  );
+  const createRunnerWorkspace = (options?: RunnerWorkspaceOptions) => {
+    const ws = workspaceFolder.name;
+    const currentJestVersion = 20;
+
+    if (!settings.jestCommandLine) {
+      throw new Error(`[${workspaceFolder.name}] missing jestCommandLine`);
+    }
+    return new ProjectWorkspace(
+      toFilePath(settings.rootPath),
+      settings.jestCommandLine,
+      '',
+      currentJestVersion,
+      outputFileSuffix(ws, options?.outputFileSuffix),
+      collectCoverage(options?.collectCoverage, settings),
+      settings.debugMode,
+      settings.nodeEnv,
+      settings.shell.toSetting(),
+      settings.useDashedArgs
+    );
+  };
   return {
     workspace: workspaceFolder,
     settings,
-    runnerWorkspace,
+    createRunnerWorkspace,
     loggingFactory: workspaceLogging(workspaceFolder.name, settings.debugMode ?? false),
-    autoRun: AutoRun(settings),
+    output,
   };
 };
 
-export const getExtensionResourceSettings = (uri: vscode.Uri): PluginResourceSettings => {
-  const config = vscode.workspace.getConfiguration('jest', uri);
+export const getExtensionResourceSettings = (
+  workspaceFolder: vscode.WorkspaceFolder
+): PluginResourceSettings => {
+  const getSetting = createJestSettingGetter(workspaceFolder);
+
+  const deprecatedSettings: DeprecatedPluginResourceSettings = {
+    showCoverageOnLoad: getSetting<boolean>('showCoverageOnLoad') ?? false,
+    autoRun: getSetting<JestExtAutoRunSetting | null>('autoRun'),
+    testExplorer: getSetting<TestExplorerConfig>('testExplorer'),
+  };
+
   return {
-    autoEnable: config.get<boolean>('autoEnable'),
-    enableSnapshotUpdateMessages: config.get<boolean>('enableSnapshotUpdateMessages'),
-    pathToConfig: config.get<string>('pathToConfig'),
-    jestCommandLine: config.get<string>('jestCommandLine'),
-    pathToJest: config.get<string>('pathToJest'),
-    restartJestOnSnapshotUpdate: config.get<boolean>('restartJestOnSnapshotUpdate'),
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    rootPath: path.join(uri.fsPath, config.get<string>('rootPath')!),
-    runAllTestsFirst: config.get<boolean>('runAllTestsFirst'),
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    showCoverageOnLoad: config.get<boolean>('showCoverageOnLoad')!,
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    coverageFormatter: config.get<string>('coverageFormatter')!,
-    debugMode: config.get<boolean>('debugMode'),
-    coverageColors: config.get<CoverageColors>('coverageColors'),
-    autoRun: config.get<JestExtAutoRunConfig>('autoRun'),
-    testExplorer: config.get<TestExplorerConfig>('testExplorer') ?? { enabled: true },
+    jestCommandLine: getSetting<string>('jestCommandLine'),
+    rootPath: toAbsoluteRootPath(workspaceFolder, getSetting<string>('rootPath')),
+    coverageFormatter: getSetting<string>('coverageFormatter') ?? 'DefaultFormatter',
+    debugMode: getSetting<boolean>('debugMode'),
+    coverageColors: getSetting<CoverageColors>('coverageColors'),
+    nodeEnv: getSetting<NodeEnv | null>('nodeEnv') ?? undefined,
+    shell: new RunShell(getSetting<string | LoginShell>('shell')),
+    monitorLongRun: getSetting<MonitorLongRun>('monitorLongRun') ?? undefined,
+    runMode: new RunMode(
+      getSetting<JestRunModeType | JestRunMode | null>('runMode'),
+      deprecatedSettings
+    ),
+    parserPluginOptions: getSetting<JESParserPluginOptions>('parserPluginOptions'),
+    enable: getSetting<boolean>('enable'),
+    useDashedArgs: getSetting<boolean>('useDashedArgs') ?? false,
+    useJest30: getSetting<boolean>('useJest30'),
   };
 };
 

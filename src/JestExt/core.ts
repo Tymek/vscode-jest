@@ -1,46 +1,48 @@
 import * as vscode from 'vscode';
 import { JestTotalResults } from 'jest-editor-support';
 
-import { TestStatus } from '../decorations/test-status';
-import { statusBar, StatusBar, Mode, StatusBarUpdate, SBTestStats } from '../StatusBar';
+import { statusBar, StatusBar, StatusBarUpdate, SBTestStats } from '../StatusBar';
 import {
-  TestReconciliationState,
   TestResultProvider,
-  TestResult,
   resultsWithLowerCaseWindowsDriveLetters,
   SortedTestResults,
-  TestResultStatusInfo,
-  TestReconciliationStateType,
+  TestResultProviderOptions,
 } from '../TestResults';
-import { testIdString, IdStringType, escapeRegExp, emptyTestStats } from '../helpers';
+import { emptyTestStats, getValidJestCommand } from '../helpers';
 import { CoverageMapProvider, CoverageCodeLensProvider } from '../Coverage';
 import { updateDiagnostics, updateCurrentDiagnostics, resetDiagnostics } from '../diagnostics';
-import { DebugCodeLensProvider, DebugTestIdentifier } from '../DebugCodeLens';
 import { DebugConfigurationProvider } from '../DebugConfigurationProvider';
-import { DecorationOptions, TestStats } from '../types';
+import { TestExplorerRunRequest, TestStats } from '../types';
 import { CoverageOverlay } from '../Coverage/CoverageOverlay';
 import { resultsWithoutAnsiEscapeSequence } from '../TestResults/TestResult';
 import { CoverageMapData } from 'istanbul-lib-coverage';
 import { Logging } from '../logging';
 import { createProcessSession, ProcessSession } from './process-session';
 import {
-  DebugFunction,
   JestExtContext,
   JestSessionEvents,
   JestExtSessionContext,
   JestRunEvent,
+  JestTestDataAvailableEvent,
 } from './types';
-import * as messaging from '../messaging';
-import { SupportedLanguageIds } from '../appGlobals';
+import { DebugInfo } from '../types';
+import { extensionName, SupportedLanguageIds } from '../appGlobals';
 import { createJestExtContext, getExtensionResourceSettings, prefixWorkspace } from './helper';
 import { PluginResourceSettings } from '../Settings';
-import { startWizard, WizardTaskId } from '../setup-wizard';
-import { JestExtExplorerContext } from '../test-provider/types';
+import { WizardTaskId } from '../setup-wizard';
+import { ItemCommand, JestExtExplorerContext } from '../test-provider/types';
 import { JestTestProvider } from '../test-provider';
 import { JestProcessInfo } from '../JestProcessManagement';
+import { getExitErrorDef } from '../errors';
+import { WorkspaceManager, isInFolder } from '../workspace-manager';
+import { ansiEsc, JestOutputTerminal } from './output-terminal';
+import { QuickFixActionType } from '../quick-fix';
+import { executableTerminalLinkProvider } from '../terminal-link-provider';
+import { outputManager } from '../output-manager';
 
-interface RunTestPickItem extends vscode.QuickPickItem {
-  id: DebugTestIdentifier;
+interface JestCommandSettings {
+  rootPath: string;
+  jestCommandLine: string;
 }
 
 /** extract lines starts and end with [] */
@@ -49,19 +51,11 @@ export class JestExt {
   coverageOverlay: CoverageOverlay;
 
   testResultProvider: TestResultProvider;
-  debugCodeLensProvider: DebugCodeLensProvider;
   debugConfigurationProvider: DebugConfigurationProvider;
   coverageCodeLensProvider: CoverageCodeLensProvider;
 
-  // So you can read what's going on
-  channel: vscode.OutputChannel;
-
-  private decorations: TestStatus;
-
   // The ability to show fails in the problems section
   private failDiagnostics: vscode.DiagnosticCollection;
-
-  // We have to keep track of our inline assert fails to remove later
 
   private processSession: ProcessSession;
   private vscodeContext: vscode.ExtensionContext;
@@ -74,31 +68,36 @@ export class JestExt {
   private testProvider?: JestTestProvider;
   public events: JestSessionEvents;
 
+  private workspaceManager: WorkspaceManager;
+  private output: JestOutputTerminal;
+  private debugConfig?: vscode.DebugConfiguration;
+
   constructor(
     vscodeContext: vscode.ExtensionContext,
     workspaceFolder: vscode.WorkspaceFolder,
-    debugCodeLensProvider: DebugCodeLensProvider,
     debugConfigurationProvider: DebugConfigurationProvider,
     coverageCodeLensProvider: CoverageCodeLensProvider
   ) {
-    const pluginSettings = getExtensionResourceSettings(workspaceFolder.uri);
+    this.vscodeContext = vscodeContext;
+    this.output = new JestOutputTerminal(workspaceFolder.name);
 
-    this.extContext = createJestExtContext(workspaceFolder, pluginSettings);
+    const pluginSettings = this.getExtensionResourceSettings(workspaceFolder);
+    this.updateOutputSetting(pluginSettings);
+
+    this.extContext = createJestExtContext(workspaceFolder, pluginSettings, this.output);
     this.logging = this.extContext.loggingFactory.create('JestExt');
+    this.workspaceManager = new WorkspaceManager();
 
-    this.channel = vscode.window.createOutputChannel(`Jest (${workspaceFolder.name})`);
     this.failDiagnostics = vscode.languages.createDiagnosticCollection(
       `Jest (${workspaceFolder.name})`
     );
-    this.debugCodeLensProvider = debugCodeLensProvider;
     this.coverageCodeLensProvider = coverageCodeLensProvider;
 
     this.coverageMapProvider = new CoverageMapProvider();
-    this.vscodeContext = vscodeContext;
     this.coverageOverlay = new CoverageOverlay(
       vscodeContext,
       this.coverageMapProvider,
-      pluginSettings.showCoverageOnLoad,
+      pluginSettings.runMode.config.coverage,
       pluginSettings.coverageFormatter,
       pluginSettings.coverageColors
     );
@@ -107,20 +106,19 @@ export class JestExt {
       onRunEvent: new vscode.EventEmitter<JestRunEvent>(),
       onTestSessionStarted: new vscode.EventEmitter<JestExtSessionContext>(),
       onTestSessionStopped: new vscode.EventEmitter<void>(),
+      onTestDataAvailable: new vscode.EventEmitter<JestTestDataAvailableEvent>(),
     };
     this.setupRunEvents(this.events);
 
     this.testResultProvider = new TestResultProvider(
       this.events,
-      pluginSettings.debugMode ?? false
+      this.testResultProviderOptions(pluginSettings)
     );
 
     this.debugConfigurationProvider = debugConfigurationProvider;
 
-    this.status = statusBar.bind(workspaceFolder.name);
+    this.status = statusBar.bind(workspaceFolder);
 
-    // The theme stuff
-    this.decorations = new TestStatus(vscodeContext);
     // reset the jest diagnostics
     resetDiagnostics(this.failDiagnostics);
 
@@ -129,75 +127,158 @@ export class JestExt {
     this.setupStatusBar();
   }
 
+  public get name(): string {
+    return this.extContext.workspace.name;
+  }
+  public get workspaceFolder(): vscode.WorkspaceFolder {
+    return this.extContext.workspace;
+  }
+
+  /**
+   * Gets the plugin resource settings for a workspace folder.
+   * @param workspaceFolder The workspace folder to get the plugin resource settings for.
+   * @returns The plugin resource settings for the workspace folder.
+   * @throws An error if Jest is disabled for the workspace folder.
+   */
+  private getExtensionResourceSettings(
+    workspaceFolder: vscode.WorkspaceFolder
+  ): PluginResourceSettings {
+    const pluginSettings = getExtensionResourceSettings(workspaceFolder);
+    if (pluginSettings.enable === false) {
+      throw new Error(`Jest is disabled for workspace ${workspaceFolder.name}`);
+    }
+    const { outputConfig, openTesting } = outputManager.outputConfigs();
+    this.output.write(
+      'Critical Settings:\r\n' +
+        `jest.runMode: ${JSON.stringify(pluginSettings.runMode.config, undefined, 4)}\r\n` +
+        `jest.outputConfig: ${JSON.stringify(outputConfig.value, undefined, 4)}\r\n` +
+        `testing.automaticallyOpenTestResults: ${JSON.stringify(openTesting.value, undefined, 4)}\r\n`,
+      'info'
+    );
+    return pluginSettings;
+  }
+
+  public showOutput(): void {
+    this.extContext.output.show();
+  }
+
   private getExtExplorerContext(): JestExtExplorerContext {
     return {
       ...this.extContext,
       sessionEvents: this.events,
       session: this.processSession,
-      testResolveProvider: this.testResultProvider,
+      testResultProvider: this.testResultProvider,
       debugTests: this.debugTests,
     };
   }
-  private setupWizardAction(taskId: WizardTaskId): messaging.MessageAction {
-    return {
-      title: 'Run Setup Wizard',
-      action: (): unknown =>
-        startWizard(this.debugConfigurationProvider, {
-          workspace: this.extContext.workspace,
-          taskId,
-          verbose: this.extContext.settings.debugMode,
-        }),
-    };
+
+  public setupExtensionForFolder(args?: { taskId: WizardTaskId }): Thenable<void> {
+    const command = `${extensionName}.setup-extension`;
+    return vscode.commands.executeCommand(command, {
+      workspace: this.extContext.workspace,
+      taskId: args?.taskId,
+      verbose: this.extContext.settings.debugMode,
+    });
   }
 
+  private longRunMessage(event: Extract<JestRunEvent, { type: 'long-run' }>): string {
+    const messages = [`Long Running Tests Warning: Jest process "${event.process.request.type}"`];
+    if (event.numTotalTestSuites != null) {
+      messages.push(`for ${event.numTotalTestSuites} suites`);
+    }
+    messages.push(`has exceeded ${event.threshold}ms.`);
+
+    return messages.join(' ');
+  }
+
+  private enableOutputOnRun(): void {
+    outputManager.showOutputOn('run', this.output, this.extContext.settings.runMode);
+  }
   private setupRunEvents(events: JestSessionEvents): void {
     events.onRunEvent.event((event: JestRunEvent) => {
+      // only process the test running event
+      if (event.process.request.type === 'not-test') {
+        return;
+      }
+      this.enableOutputOnRun();
+
       switch (event.type) {
-        case 'scheduled':
-          this.channel.appendLine(`${event.process.id} is scheduled`);
-          break;
-        case 'data':
-          if (event.newLine) {
-            this.channel.appendLine(event.text);
-          } else {
-            this.channel.append(event.text);
-          }
-          if (event.isError) {
-            this.channel.show();
-          }
-          break;
-        case 'start':
+        case 'start': {
           this.updateStatusBar({ state: 'running' });
-          this.channel.clear();
           break;
-        case 'end':
-          this.updateStatusBar({ state: 'done' });
+        }
+        case 'end': {
+          const state = event.error ? 'exec-error' : 'done';
+          this.updateStatusBar({ state });
+
+          // testError should be persistent per run-cycle. Not clear up this flag at end end of the cycle
+          // could cause the processes with multiple run cycles, such as watch mode, to failed to act properly.
+          if (event.process.userData?.testError) {
+            event.process.userData.testError = undefined;
+          }
           break;
+        }
         case 'exit':
           if (event.error) {
-            this.updateStatusBar({ state: 'stopped' });
-            const msg = `${event.error}\n see troubleshooting: ${messaging.TROUBLESHOOTING_URL}`;
-            this.channel.appendLine(msg);
-            this.channel.show();
-            messaging.systemErrorMessage(
-              event.error,
-              messaging.showTroubleshootingAction,
-              this.setupWizardAction('cmdLine')
-            );
+            this.updateStatusBar({ state: 'exec-error' });
+            if (!event.process.userData?.execError) {
+              this.outputActionMessages(
+                `Jest process exited unexpectedly: ${event.error}`,
+                ['wizard', 'defer', 'disable-folder', 'help'],
+                true,
+                event.error
+              );
+              event.process.userData = { ...(event.process.userData ?? {}), execError: true };
+            }
           } else {
             this.updateStatusBar({ state: 'done' });
           }
           break;
+        case 'data': {
+          if (event.isError) {
+            this.updateStatusBar({ state: 'exec-error' });
+          }
+          break;
+        }
+        case 'test-error': {
+          if (!event.process.userData?.testError) {
+            outputManager.showOutputOn('test-error', this.output, this.extContext.settings.runMode);
+            event.process.userData = { ...(event.process.userData ?? {}), testError: true };
+          }
+          break;
+        }
+        case 'long-run': {
+          this.outputActionMessages(this.longRunMessage(event), ['help-long-run'], false);
+          break;
+        }
       }
     });
   }
 
+  private outputActionMessages = (
+    errorMessage: string,
+    actionTypes: QuickFixActionType[],
+    isError: boolean,
+    extra?: unknown
+  ): void => {
+    const msg = prefixWorkspace(this.extContext, errorMessage);
+    this.logging(isError ? 'error' : 'warn', `${msg}:`, extra);
+    this.output.write(errorMessage, isError ? 'error' : 'new-line');
+    const quickFixLink = executableTerminalLinkProvider.executableLink(
+      this.extContext.workspace.name,
+      `${extensionName}.with-workspace.show-quick-fix`,
+      actionTypes
+    );
+    this.output.write(`Open Quick Fix: \u2192 ${quickFixLink}`, 'info');
+  };
+
   private createProcessSession(): ProcessSession {
-    return createProcessSession({
+    const sessionContext = {
       ...this.extContext,
       updateWithData: this.updateWithData.bind(this),
       onRunEvent: this.events.onRunEvent,
-    });
+    };
+    return createProcessSession(sessionContext);
   }
   private toSBStats(stats: TestStats): SBTestStats {
     return { ...stats, isDirty: this.dirtyFiles.size > 0 };
@@ -211,6 +292,16 @@ export class JestExt {
    */
   public async startSession(newSession = false): Promise<void> {
     try {
+      if (this.extContext.settings.runMode.config.deferred) {
+        // in deferred mode, we only start the test provider and nothing else
+        this.testProvider?.dispose();
+        this.testProvider = new JestTestProvider(this.getExtExplorerContext());
+        this.resetStatusBar();
+
+        this.updateVisibleTextEditors();
+        return;
+      }
+
       this.dirtyFiles.clear();
       this.resetStatusBar();
 
@@ -218,37 +309,37 @@ export class JestExt {
       if (newSession) {
         await this.processSession.stop();
         this.processSession = this.createProcessSession();
-        this.channel.appendLine('Starting a new Jest Process Session');
-      } else {
-        this.channel.appendLine('Starting Jest Session');
       }
 
       this.testProvider?.dispose();
-      if (this.extContext.settings.testExplorer.enabled) {
-        this.testProvider = new JestTestProvider(this.getExtExplorerContext());
+      this.testProvider = new JestTestProvider(this.getExtExplorerContext());
+
+      const readyState = await this.validateJestCommandLine();
+      if (readyState !== 'pass') {
+        return;
       }
 
       await this.processSession.start();
 
       this.events.onTestSessionStarted.fire({ ...this.extContext, session: this.processSession });
 
-      this.updateTestFileList();
-      this.channel.appendLine('Jest Session Started');
+      await this.updateTestFileList();
+
+      // update visible editors that belong to this folder
+      this.updateVisibleTextEditors();
     } catch (e) {
-      const msg = prefixWorkspace(this.extContext, 'Failed to start jest session');
-      this.logging('error', `${msg}:`, e);
-      this.channel.appendLine('Failed to start jest session');
-      messaging.systemErrorMessage(
-        `${msg}...`,
-        messaging.showTroubleshootingAction,
-        this.setupWizardAction('cmdLine')
+      this.outputActionMessages(
+        `Failed to start jest session: ${e}`,
+        ['wizard', 'defer', 'disable-folder', 'help'],
+        true,
+        e
       );
+      this.updateStatusBar({ state: 'exec-error' });
     }
   }
 
   public async stopSession(): Promise<void> {
     try {
-      this.channel.appendLine('Stopping Jest Session');
       await this.processSession.stop();
 
       this.testProvider?.dispose();
@@ -256,21 +347,18 @@ export class JestExt {
 
       this.events.onTestSessionStopped.fire();
 
-      this.channel.appendLine('Jest Session Stopped');
       this.updateStatusBar({ state: 'stopped' });
     } catch (e) {
-      const msg = prefixWorkspace(this.extContext, 'Failed to stop jest session');
-      this.logging('error', `${msg}:`, e);
-      this.channel.appendLine('Failed to stop jest session');
-      messaging.systemErrorMessage('${msg}...', messaging.showTroubleshootingAction);
+      this.outputActionMessages(
+        `Failed to stop jest session: ${e}`,
+        ['defer', 'disable-folder', 'help'],
+        true,
+        e
+      );
+      this.updateStatusBar({ state: 'exec-error' });
     }
   }
 
-  /** update custom editor context used by vscode when clause, such as `jest:run.interactive` in package.json */
-  private updateEditorContext(): void {
-    const isInteractive = this.extContext.autoRun.isOff || !this.extContext.autoRun.isWatch;
-    vscode.commands.executeCommand('setContext', 'jest:run.interactive', isInteractive);
-  }
   private updateTestFileEditor(editor: vscode.TextEditor): void {
     if (!this.isTestFileEditor(editor)) {
       return;
@@ -281,7 +369,7 @@ export class JestExt {
     try {
       sortedResults = this.testResultProvider.getSortedResults(filePath);
     } catch (e) {
-      this.channel.appendLine(`${filePath}: failed to parse test results: ${e.toString()}`);
+      this.extContext.output.write(`${filePath}: failed to parse test results: ${e}`, 'error');
       // assign an empty result so we can clear the outdated decorators/diagnostics etc
       sortedResults = {
         fail: [],
@@ -295,89 +383,78 @@ export class JestExt {
       return;
     }
 
-    this.updateDecorators(sortedResults, editor);
     updateCurrentDiagnostics(sortedResults.fail, this.failDiagnostics, editor);
   }
 
-  public triggerUpdateActiveEditor(editor: vscode.TextEditor): void {
-    this.updateEditorContext();
-
-    this.coverageOverlay.updateVisibleEditors();
-
+  private triggerUpdateActiveEditor(editor: vscode.TextEditor): void {
+    this.coverageOverlay.update(editor);
     this.updateTestFileEditor(editor);
   }
 
-  public triggerUpdateSettings(newSettings?: PluginResourceSettings): Promise<void> {
+  private updateOutputSetting(settings: PluginResourceSettings): void {
+    this.output.revealOnError = !settings.runMode.config.deferred;
+    this.output.close();
+  }
+  private testResultProviderOptions(settings: PluginResourceSettings): TestResultProviderOptions {
+    return {
+      verbose: settings.debugMode ?? false,
+      parserOptions: settings.parserPluginOptions
+        ? { plugins: settings.parserPluginOptions }
+        : undefined,
+    };
+  }
+  public async triggerUpdateSettings(newSettings?: PluginResourceSettings): Promise<void> {
     const updatedSettings =
-      newSettings ?? getExtensionResourceSettings(this.extContext.workspace.uri);
-    this.extContext = createJestExtContext(this.extContext.workspace, updatedSettings);
+      newSettings ?? this.getExtensionResourceSettings(this.extContext.workspace);
 
-    // debug
-    this.testResultProvider.verbose = updatedSettings.debugMode ?? false;
+    // output
+    this.updateOutputSetting(updatedSettings);
+
+    // TestResultProvider
+    this.testResultProvider.options = this.testResultProviderOptions(updatedSettings);
 
     // coverage
-    const showCoverage = this.coverageOverlay.enabled ?? updatedSettings.showCoverageOnLoad;
     this.coverageOverlay.dispose();
-
     this.coverageOverlay = new CoverageOverlay(
       this.vscodeContext,
       this.coverageMapProvider,
-      updatedSettings.showCoverageOnLoad,
+      updatedSettings.runMode.config.coverage,
       updatedSettings.coverageFormatter,
       updatedSettings.coverageColors
     );
-    this.extContext.runnerWorkspace.collectCoverage = showCoverage;
-    this.coverageOverlay.enabled = showCoverage;
 
-    return this.startSession(true);
+    this.extContext = createJestExtContext(this.extContext.workspace, updatedSettings, this.output);
+    this.debugConfig = undefined;
+
+    await this.startSession(true);
   }
 
-  updateDecorators(testResults: SortedTestResults, editor: vscode.TextEditor): void {
-    if (
-      this.extContext.settings.testExplorer.enabled === false ||
-      this.extContext.settings.testExplorer.showClassicStatus
-    ) {
-      // Status indicators (gutter icons)
-      const styleMap = [
-        {
-          data: testResults.success,
-          decorationType: this.decorations.passing,
-          state: TestReconciliationState.KnownSuccess,
-        },
-        {
-          data: testResults.fail,
-          decorationType: this.decorations.failing,
-          state: TestReconciliationState.KnownFail,
-        },
-        {
-          data: testResults.skip,
-          decorationType: this.decorations.skip,
-          state: TestReconciliationState.KnownSkip,
-        },
-        {
-          data: testResults.unknown,
-          decorationType: this.decorations.unknown,
-          state: TestReconciliationState.Unknown,
-        },
-      ];
-
-      styleMap.forEach((style) => {
-        const decorators = this.generateDotsForItBlocks(style.data, style.state);
-        editor.setDecorations(style.decorationType, decorators);
-      });
-    }
-
-    // Debug CodeLens
-    this.debugCodeLensProvider.didChange();
+  /**
+   * Updates the valid text editors based on the specified document.
+   * If a document is provided, it triggers an update for the active editor matches the document.
+   * If no document is provided, it triggers an update for all editors that are in the workspace folder
+   *
+   * @param document The document to match against the active editor. Optional.
+   */
+  private updateVisibleTextEditors(document?: vscode.TextDocument): void {
+    vscode.window.visibleTextEditors.forEach((editor) => {
+      if (document) {
+        if (editor.document === document) {
+          this.triggerUpdateActiveEditor(editor);
+        }
+      } else if (this.isInWorkspaceFolder(editor)) {
+        this.triggerUpdateActiveEditor(editor);
+      }
+    });
   }
 
-  private isSupportedDocument(document: vscode.TextDocument | undefined): boolean {
-    if (!document) {
-      return false;
-    }
+  private isInWorkspaceFolder(editor: vscode.TextEditor): boolean {
+    return isInFolder(editor.document.uri, this.extContext.workspace);
+  }
 
+  private isSupportedDocument(document?: vscode.TextDocument | undefined): boolean {
     // if no testFiles list, then error on including more possible files as long as they are in the supported languages - this is backward compatible with v3 logic
-    return SupportedLanguageIds.includes(document.languageId);
+    return (document && SupportedLanguageIds.includes(document.languageId)) ?? false;
   }
 
   private isTestFileEditor(editor: vscode.TextEditor): boolean {
@@ -385,29 +462,104 @@ export class JestExt {
       return false;
     }
 
-    if (this.testResultProvider.isTestFile(editor.document.fileName) === 'no') {
-      return false;
-    }
-
-    // if isTestFile returns unknown or true, treated it like a test file to give it best chance to display any test result if ever available
-    return true;
+    return this.testResultProvider.isTestFile(editor.document.fileName);
   }
 
-  public activate(): void {
-    if (
-      vscode.window.activeTextEditor?.document.uri &&
-      vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri) ===
-        this.extContext.workspace
-    ) {
-      this.onDidChangeActiveTextEditor(vscode.window.activeTextEditor);
+  /**
+   * validate if there is a valid jest commandline. If the simple default command line is not valid,
+   * it will take on a more
+   *
+   * @returns
+   */
+  public async validateJestCommandLine(): Promise<'pass' | 'fail' | 'restart'> {
+    if (this.extContext.settings.jestCommandLine) {
+      return Promise.resolve('pass');
     }
+
+    const updateSettings = async (update: JestCommandSettings): Promise<'restart'> => {
+      this.extContext.settings.jestCommandLine = update.jestCommandLine;
+      this.extContext.settings.rootPath = update.rootPath;
+      await this.triggerUpdateSettings(this.extContext.settings);
+      return 'restart';
+    };
+
+    const outputSettings = (settings: JestCommandSettings) => {
+      this.extContext.output.write(
+        'found:\r\n' +
+          `  ${ansiEsc('bold', 'rootPath')}: ${settings.rootPath}\r\n` +
+          `  ${ansiEsc('bold', 'jestCommandLine')}: ${settings.jestCommandLine}\r\n`,
+        'new-line'
+      );
+    };
+
+    const t0 = Date.now();
+    this.extContext.output.write('auto config:', 'info');
+    const result = await getValidJestCommand(
+      this.extContext.workspace,
+      this.workspaceManager,
+      this.extContext.settings.rootPath
+    );
+    const perf = Date.now() - t0;
+    /* istanbul ignore next */
+    if (perf > 2000) {
+      this.extContext.output.write(
+        `auto config took ${perf} msec. Might be more efficient to update settings directly`,
+        'warn'
+      );
+    }
+
+    const foundPackage = result.uris && result.uris.length > 0;
+    if (foundPackage) {
+      this.extContext.output.write(
+        'examining the following package roots:\r\n' +
+          `  ${result.uris?.map((uri) => uri.fsPath).join('\r\n  ')}`,
+        'new-line'
+      );
+    }
+
+    let msg = 'Not able to auto detect a valid jest command';
+    let actionType: QuickFixActionType = 'setup-cmdline';
+
+    switch (result.validSettings.length) {
+      case 1:
+        outputSettings(result.validSettings[0]);
+        return updateSettings(result.validSettings[0]);
+      case 0: {
+        if (foundPackage) {
+          this.extContext.output.write(
+            'not able to find test script or jest/CRA binary in any of the package roots',
+            'warn'
+          );
+        } else {
+          this.extContext.output.write('no package.json file found', 'warn');
+        }
+        break;
+      }
+      default: {
+        msg = `${msg}: multiple candidates found`;
+        if (vscode.workspace.workspaceFolders?.length === 1) {
+          msg += ' Perhaps this is a multi-root monorepo?';
+          actionType = 'setup-monorepo';
+        }
+        break;
+      }
+    }
+
+    this.outputActionMessages(msg, [actionType, 'defer', 'disable-folder', 'help'], true);
+    this.updateStatusBar({ state: 'exec-error' });
+    return 'fail';
+  }
+  /* istanbul ignore next */
+  public activate(): void {
+    // do nothing
   }
   public deactivate(): void {
     this.stopSession();
-    this.channel.dispose();
+    this.extContext.output.dispose();
 
     this.testResultProvider.dispose();
     this.testProvider?.dispose();
+    statusBar.removeWorkspaceFolder(this.extContext.workspace);
 
     this.events.onRunEvent.dispose();
     this.events.onTestSessionStarted.dispose();
@@ -415,78 +567,83 @@ export class JestExt {
   }
 
   //**  commands */
-  public debugTests: DebugFunction = async (
-    document: vscode.TextDocument | string,
-    ...ids: DebugTestIdentifier[]
-  ): Promise<void> => {
-    const idString = (type: IdStringType, id: DebugTestIdentifier): string =>
-      typeof id === 'string' ? id : testIdString(type, id);
-    const selectTest = async (
-      testIdentifiers: DebugTestIdentifier[]
-    ): Promise<DebugTestIdentifier | undefined> => {
-      const items: RunTestPickItem[] = testIdentifiers.map((id) => ({
-        label: idString('display-reverse', id),
-        id,
-      }));
-      const selected = await vscode.window.showQuickPick<RunTestPickItem>(items, {
-        placeHolder: 'Select a test to debug',
-      });
+  public debugTests = async (debugInfo: DebugInfo): Promise<void> => {
+    const getDebugConfig = (
+      folder?: vscode.WorkspaceFolder
+    ): vscode.DebugConfiguration | undefined => {
+      const configs = vscode.workspace
+        .getConfiguration('launch', folder)
+        ?.get<vscode.DebugConfiguration[]>('configurations');
+      if (!configs) {
+        return undefined;
+      }
 
-      return selected?.id;
+      const { sorted } = this.debugConfigurationProvider.getDebugConfigNames(
+        this.extContext.workspace
+      );
+      for (const name of sorted) {
+        const found = configs.find((c) => c.name === name);
+        if (found) {
+          return found;
+        }
+      }
     };
-    let testId: DebugTestIdentifier | undefined;
-    switch (ids.length) {
-      case 0:
-        return;
-      case 1:
-        testId = ids[0];
-        break;
-      default:
-        testId = await selectTest(ids);
-        break;
-    }
-
-    if (!testId) {
-      return;
-    }
 
     this.debugConfigurationProvider.prepareTestRun(
-      typeof document === 'string' ? document : document.fileName,
-      escapeRegExp(idString('full-name', testId))
+      debugInfo,
+      this.extContext.workspace,
+      this.extContext.settings.useJest30
     );
 
-    let debugConfig = vscode.workspace
-      .getConfiguration('launch', this.extContext.workspace.uri)
-      ?.get<vscode.DebugConfiguration[]>('configurations')
-      ?.filter((config) => config.name === 'vscode-jest-tests')[0];
+    let debugConfig =
+      getDebugConfig(this.extContext.workspace) ?? getDebugConfig() ?? this.debugConfig;
+
     if (!debugConfig) {
-      messaging.systemWarningMessage(
-        prefixWorkspace(
-          this.extContext,
-          'No debug config named "vscode-jest-tests" found in launch.json, will use a default config.\nIf you encountered debugging problems, feel free to try the setup wizard below'
-        ),
-        this.setupWizardAction('debugConfig')
+      this.logging(
+        'debug',
+        'No debug config named "vscode-jest-tests.v2" or "vscode-jest-tests" found in launch.json, will use a default config.'
       );
-      debugConfig = this.debugConfigurationProvider.provideDebugConfigurations(
-        this.extContext.workspace
-      )[0];
+      debugConfig = this.debugConfigurationProvider.createDebugConfig(this.extContext.workspace, {
+        jestCommandLine: this.extContext.settings.jestCommandLine,
+        rootPath: this.extContext.settings.rootPath,
+        nodeEnv: this.extContext.settings.nodeEnv,
+      });
+
+      this.debugConfig = debugConfig;
+      this.extContext.output.write('auto config debug config:', 'info');
+      this.extContext.output.write(JSON.stringify(debugConfig, undefined, '  '), 'new-line');
     }
-    vscode.debug.startDebugging(this.extContext.workspace, debugConfig);
+    await vscode.debug.startDebugging(this.extContext.workspace, debugConfig);
   };
-  public runAllTests(editor?: vscode.TextEditor): void {
+  public async runAllTests(editor?: vscode.TextEditor): Promise<void> {
+    this.enableOutputOnRun();
+    await this.exitDeferMode();
+
     if (!editor) {
-      if (this.processSession.scheduleProcess({ type: 'all-tests' })) {
+      if (this.processSession.scheduleProcess({ type: 'all-tests', nonBlocking: true })) {
         this.dirtyFiles.clear();
         return;
       }
     } else {
       const name = editor.document.fileName;
-      if (
-        this.processSession.scheduleProcess({
+      let pInfo;
+      if (!this.testResultProvider.isTestFile(name)) {
+        // run related tests from source file
+        pInfo = this.processSession.scheduleProcess({
           type: 'by-file',
           testFileName: name,
-        })
-      ) {
+          notTestFile: true,
+        });
+      } else {
+        // note: use file-pattern instead of file-path to increase compatibility, such as for angular users.
+        // However, we should keep an eye on performance, as matching by pattern could be slower than by explicit path.
+        // If performance ever become an issue, we could consider optimization...
+        pInfo = this.processSession.scheduleProcess({
+          type: 'by-file-pattern',
+          testFileNamePattern: name,
+        });
+      }
+      if (pInfo) {
         this.dirtyFiles.delete(name);
         return;
       }
@@ -518,20 +675,24 @@ export class JestExt {
   }
 
   private handleOnSaveRun(document: vscode.TextDocument): void {
-    if (!this.isSupportedDocument(document) || this.extContext.autoRun.isWatch) {
+    if (
+      !this.isSupportedDocument(document) ||
+      this.extContext.settings.runMode.config.deferred ||
+      this.extContext.settings.runMode.config.type !== 'on-save'
+    ) {
       return;
     }
-    if (
-      this.extContext.autoRun.onSave &&
-      (this.extContext.autoRun.onSave === 'test-src-file' ||
-        this.testResultProvider.isTestFile(document.fileName) !== 'no')
-    ) {
+    const isTestFile = this.testResultProvider.isTestFile(document.fileName);
+
+    if (!isTestFile && this.extContext.settings.runMode.config.testFileOnly) {
+      // not a test file and configured not to re-run test for non-test files => mark the workspace dirty
+      this.dirtyFiles.add(document.fileName);
+    } else {
       this.processSession.scheduleProcess({
         type: 'by-file',
         testFileName: document.fileName,
+        notTestFile: !isTestFile,
       });
-    } else {
-      this.dirtyFiles.add(document.fileName);
     }
   }
 
@@ -540,14 +701,7 @@ export class JestExt {
    * @param document refresh UI for the specific document. if undefined, refresh all active editors in the workspace.
    */
   private refreshDocumentChange(document?: vscode.TextDocument): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (
-        (document && editor.document === document) ||
-        vscode.workspace.getWorkspaceFolder(editor.document.uri) === this.extContext.workspace
-      ) {
-        this.triggerUpdateActiveEditor(editor);
-      }
-    }
+    this.updateVisibleTextEditors(document);
 
     this.updateStatusBar({
       stats: this.toSBStats(this.testResultProvider.getTestSuiteStats()),
@@ -571,7 +725,7 @@ export class JestExt {
       return;
     }
 
-    // there is a bit redudant since didSave already handle the save changes
+    // there is a bit redundant since didSave already handle the save changes
     // but not sure if there are other non-editor related change we are trying
     // to capture, so leave it be for now...
     this.refreshDocumentChange(event.document);
@@ -580,7 +734,6 @@ export class JestExt {
   onWillSaveTextDocument(event: vscode.TextDocumentWillSaveEvent): void {
     if (event.document.isDirty) {
       this.removeCachedTestResults(event.document, true);
-      this.refreshDocumentChange(event.document);
     }
   }
   onDidSaveTextDocument(document: vscode.TextDocument): void {
@@ -588,25 +741,26 @@ export class JestExt {
     this.refreshDocumentChange(document);
   }
 
-  private updateTestFileList(): void {
-    this.processSession.scheduleProcess({
-      type: 'list-test-files',
-      onResult: (files, error) => {
-        this.setTestFiles(files);
-        this.logging('debug', `found ${files?.length} testFiles`);
-        if (error) {
-          const msg = prefixWorkspace(
-            this.extContext,
-            'Failed to obtain test file list, something might not be setup right?'
-          );
-          this.logging('error', msg, error);
-          messaging.systemWarningMessage(
-            msg,
-            messaging.showTroubleshootingAction,
-            this.setupWizardAction('cmdLine')
-          );
-        }
-      },
+  private async updateTestFileList(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.processSession.scheduleProcess({
+        type: 'list-test-files',
+        onResult: (files, error, exitCode) => {
+          this.setTestFiles(files);
+          this.logging('debug', `found ${files?.length} testFiles`);
+          if (error) {
+            const msg =
+              'failed to retrieve test file list. TestExplorer might show incomplete test items';
+            this.extContext.output.write(error, 'new-line');
+            const errorType = getExitErrorDef(exitCode) ?? 'error';
+            this.extContext.output.write(msg, errorType);
+            this.logging('error', msg, error);
+            reject(error);
+          } else {
+            resolve();
+          }
+        },
+      });
     });
   }
 
@@ -620,11 +774,68 @@ export class JestExt {
     this.updateTestFileList();
   }
 
-  toggleCoverageOverlay(): void {
-    this.coverageOverlay.toggleVisibility();
+  toggleCoverage(): Promise<void> {
+    this.extContext.settings.runMode.toggleCoverage();
+    return this.triggerUpdateSettings(this.extContext.settings);
+  }
+  // exit defer runMode
+  async exitDeferMode(trigger?: TestExplorerRunRequest): Promise<void> {
+    if (trigger) {
+      this.enableOutputOnRun();
+    }
+    if (this.extContext.settings.runMode.config.deferred) {
+      this.extContext.settings.runMode.exitDeferMode();
+      this.extContext.output.write('exit defer mode', 'new-line');
+      await this.triggerUpdateSettings(this.extContext.settings);
+      if (trigger && this.testProvider) {
+        try {
+          await this.testProvider.runTests(trigger.request, trigger.token, true);
+        } catch (e) {
+          this.logging('error', 'failed to resume runs prior to defer mode', e);
+          this.extContext.output.write(
+            'failed to resume runs prior to defer mode, you might need to trigger the run again',
+            'error'
+          );
+        }
+      }
+    }
+  }
 
-    // restart jest since coverage condition has changed
+  async saveRunMode(): Promise<void> {
+    try {
+      await this.extContext.settings.runMode.save(this.extContext.workspace);
+    } catch (e) {
+      this.logging('error', 'failed to save runMode', e);
+      this.extContext.output.write(
+        'failed to save the runMode settings. ${e}. \r\nPlease report this error.',
+        'error'
+      );
+    }
+  }
+
+  // this method is invoked by the TestExplorer UI
+  async changeRunMode(): Promise<void> {
+    const runMode = await this.extContext.settings.runMode.quickSwitch(this.vscodeContext);
+    if (runMode) {
+      const newSettings = { ...this.extContext.settings, runMode };
+      return this.triggerUpdateSettings(newSettings);
+    }
+  }
+  async runItemCommand(testItem: vscode.TestItem, itemCommand: ItemCommand): Promise<void> {
+    this.enableOutputOnRun();
+    await this.exitDeferMode();
+    return this.testProvider?.runItemCommand(testItem, itemCommand);
+  }
+  enableLoginShell(): void {
+    if (this.extContext.settings.shell.useLoginShell) {
+      return;
+    }
+    this.extContext.settings.shell.enableLoginShell();
     this.triggerUpdateSettings(this.extContext.settings);
+    this.extContext.output.write(
+      `possible process env issue detected, restarting with a login-shell...\r\n`,
+      'warn'
+    );
   }
 
   private setupStatusBar(): void {
@@ -632,13 +843,11 @@ export class JestExt {
   }
 
   private resetStatusBar(): void {
-    const modes: Mode[] = [];
-    if (this.coverageOverlay.enabled) {
-      modes.push('coverage');
-    }
-    modes.push(this.extContext.autoRun.mode);
-
-    this.updateStatusBar({ state: 'initial', mode: modes, stats: emptyTestStats() });
+    this.updateStatusBar({
+      state: 'initial',
+      mode: this.extContext.settings.runMode,
+      stats: emptyTestStats(),
+    });
   }
   private updateStatusBar(status: StatusBarUpdate): void {
     this.status.update(status);
@@ -653,23 +862,14 @@ export class JestExt {
   private updateWithData(data: JestTotalResults, process: JestProcessInfo): void {
     const noAnsiData = resultsWithoutAnsiEscapeSequence(data);
     const normalizedData = resultsWithLowerCaseWindowsDriveLetters(noAnsiData);
-    this._updateCoverageMap(normalizedData.coverageMap);
 
+    this.events.onTestDataAvailable.fire({ data: normalizedData, process });
+
+    this._updateCoverageMap(normalizedData.coverageMap);
     const statusList = this.testResultProvider.updateTestResults(normalizedData, process);
 
     updateDiagnostics(statusList, this.failDiagnostics);
 
     this.refreshDocumentChange();
-  }
-
-  private generateDotsForItBlocks(
-    blocks: TestResult[],
-    state: TestReconciliationStateType
-  ): DecorationOptions[] {
-    return blocks.map((it) => ({
-      range: new vscode.Range(it.start.line, it.start.column, it.start.line, it.start.column + 1),
-      hoverMessage: TestResultStatusInfo[state].desc,
-      identifier: it.name,
-    }));
   }
 }

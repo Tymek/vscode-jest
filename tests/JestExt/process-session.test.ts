@@ -1,11 +1,12 @@
 jest.unmock('../../src/JestExt/process-session');
 jest.unmock('../../src/JestExt/helper');
+jest.unmock('../../src/JestExt/run-mode');
 jest.unmock('../test-helper');
 
 import { createProcessSession } from '../../src/JestExt/process-session';
 import * as listeners from '../../src/JestExt/process-listeners';
 import { JestProcessManager } from '../../src/JestProcessManagement';
-import { AutoRun } from '../../src/JestExt/helper';
+import { RunMode } from '../../src/JestExt/run-mode';
 import { mockJestProcessContext } from '../test-helper';
 
 const mockProcessManager = JestProcessManager as jest.Mocked<any>;
@@ -28,30 +29,36 @@ describe('ProcessSession', () => {
     context = mockJestProcessContext();
   });
   describe('scheduleProcess', () => {
+    const transform = (rRequest) => {
+      rRequest.schedule.queue = 'blocking-2';
+      return rRequest;
+    };
     it('will fire event for successful schedule', () => {
       const sm = createProcessSession(context);
 
       processManagerMock.scheduleJestProcess.mockReturnValueOnce(undefined);
       let process = sm.scheduleProcess({ type: 'all-tests' });
       expect(process).toBeUndefined();
-      expect(context.onRunEvent.fire).not.toBeCalled();
+      expect(context.onRunEvent.fire).not.toHaveBeenCalled();
 
       const p = { id: 'whatever' };
       processManagerMock.scheduleJestProcess.mockReturnValueOnce(p);
       process = sm.scheduleProcess({ type: 'all-tests' });
       expect(process).toEqual(p);
-      expect(context.onRunEvent.fire).toBeCalledWith({ type: 'scheduled', process });
+      expect(context.onRunEvent.fire).toHaveBeenCalledWith({ type: 'scheduled', process });
     });
     it.each`
-      type                      | inputProperty                                                | expectedSchedule                                                                        | expectedExtraProperty
-      ${'all-tests'}            | ${undefined}                                                 | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'] } }}                        | ${undefined}
-      ${'watch-tests'}          | ${undefined}                                                 | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'] } }}                        | ${undefined}
-      ${'watch-all-tests'}      | ${undefined}                                                 | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'] } }}                        | ${undefined}
-      ${'by-file'}              | ${{ testFileName: 'abc' }}                                   | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'] } }}                        | ${undefined}
-      ${'by-file-test'}         | ${{ testFileName: 'abc', testNamePattern: 'a test' }}        | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'], filterByContent: true } }} | ${undefined}
-      ${'by-file-pattern'}      | ${{ testFileNamePattern: 'abc' }}                            | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'] } }}                        | ${undefined}
-      ${'by-file-test-pattern'} | ${{ testFileNamePattern: 'abc', testNamePattern: 'a test' }} | ${{ queue: 'blocking', dedup: { filterByStatus: ['pending'], filterByContent: true } }} | ${undefined}
-      ${'list-test-files'}      | ${undefined}                                                 | ${{ queue: 'non-blocking', dedup: { filterByStatus: ['pending'] } }}                    | ${{ type: 'not-test', args: ['--listTests', '--json', '--watchAll=false'] }}
+      type                      | inputProperty                                                | expectedSchedule                                                                           | expectedExtraProperty
+      ${'all-tests'}            | ${undefined}                                                 | ${{ queue: 'blocking', dedupe: { filterByStatus: ['pending'] } }}                          | ${undefined}
+      ${'all-tests'}            | ${{ nonBlocking: true }}                                     | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'] } }}                        | ${undefined}
+      ${'all-tests'}            | ${{ transform }}                                             | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'] } }}                        | ${undefined}
+      ${'watch-tests'}          | ${undefined}                                                 | ${{ queue: 'blocking', dedupe: { filterByStatus: ['pending'] } }}                          | ${undefined}
+      ${'watch-all-tests'}      | ${undefined}                                                 | ${{ queue: 'blocking', dedupe: { filterByStatus: ['pending'] } }}                          | ${undefined}
+      ${'by-file'}              | ${{ testFileName: 'abc' }}                                   | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'] } }}                        | ${undefined}
+      ${'by-file-test'}         | ${{ testFileName: 'abc', testNamePattern: 'a test' }}        | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'], filterByContent: true } }} | ${undefined}
+      ${'by-file-pattern'}      | ${{ testFileNamePattern: 'abc' }}                            | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'] } }}                        | ${undefined}
+      ${'by-file-test-pattern'} | ${{ testFileNamePattern: 'abc', testNamePattern: 'a test' }} | ${{ queue: 'blocking-2', dedupe: { filterByStatus: ['pending'], filterByContent: true } }} | ${undefined}
+      ${'list-test-files'}      | ${undefined}                                                 | ${{ queue: 'non-blocking', dedupe: { filterByStatus: ['pending'] } }}                      | ${{ type: 'not-test', args: ['--listTests', '--json', '--watchAll=false'] }}
     `(
       "can schedule '$type' request with ProcessManager",
       ({ type, inputProperty, expectedSchedule, expectedExtraProperty }) => {
@@ -74,35 +81,6 @@ describe('ProcessSession', () => {
         }
       }
     );
-    it.each`
-      baseRequest                                                                                | snapshotRequest
-      ${{ type: 'watch-tests' }}                                                                 | ${{ type: 'all-tests', updateSnapshot: true }}
-      ${{ type: 'watch-all-tests' }}                                                             | ${{ type: 'all-tests', updateSnapshot: true }}
-      ${{ type: 'all-tests' }}                                                                   | ${{ type: 'all-tests', updateSnapshot: true }}
-      ${{ type: 'by-file', testFileName: 'abc' }}                                                | ${{ type: 'by-file', testFileName: 'abc', updateSnapshot: true }}
-      ${{ type: 'by-file', testFileName: 'abc', updateSnapshot: true }}                          | ${undefined}
-      ${{ type: 'by-file-pattern', testFileNamePattern: 'abc' }}                                 | ${{ type: 'by-file-pattern', testFileNamePattern: 'abc', updateSnapshot: true }}
-      ${{ type: 'by-file-test', testFileName: 'abc', testNamePattern: 'a test' }}                | ${{ type: 'by-file-test', testFileName: 'abc', testNamePattern: 'a test', updateSnapshot: true }}
-      ${{ type: 'by-file-test-pattern', testFileNamePattern: 'abc', testNamePattern: 'a test' }} | ${{ type: 'by-file-test-pattern', testFileNamePattern: 'abc', testNamePattern: 'a test', updateSnapshot: true }}
-    `(
-      'can schedule update-snapshot request: $baseRequest',
-      async ({ baseRequest, snapshotRequest }) => {
-        expect.hasAssertions();
-        const sm = createProcessSession(context);
-        expect(mockProcessManager).toHaveBeenCalledTimes(1);
-
-        sm.scheduleProcess({ type: 'update-snapshot', baseRequest });
-
-        if (snapshotRequest) {
-          expect(processManagerMock.scheduleJestProcess).toHaveBeenCalledWith(
-            expect.objectContaining(snapshotRequest)
-          );
-        } else {
-          expect(processManagerMock.scheduleJestProcess).not.toHaveBeenCalled();
-        }
-      }
-    );
-
     it.each([['not-test']])('currently does not support "%s" request scheduling', (type) => {
       expect.hasAssertions();
       const sm = createProcessSession(context);
@@ -113,13 +91,12 @@ describe('ProcessSession', () => {
       expect(processManagerMock.scheduleJestProcess).not.toHaveBeenCalled();
     });
     describe.each`
-      type                 | inputProperty                             | defaultListener
-      ${'all-tests'}       | ${undefined}                              | ${listeners.RunTestListener}
-      ${'watch-tests'}     | ${undefined}                              | ${listeners.RunTestListener}
-      ${'watch-all-tests'} | ${undefined}                              | ${listeners.RunTestListener}
-      ${'by-file'}         | ${{ testFileNamePattern: 'abc' }}         | ${listeners.RunTestListener}
-      ${'list-test-files'} | ${undefined}                              | ${listeners.ListTestFileListener}
-      ${'update-snapshot'} | ${{ baseRequest: { type: 'all-tests' } }} | ${listeners.RunTestListener}
+      type                 | inputProperty                     | defaultListener
+      ${'all-tests'}       | ${undefined}                      | ${listeners.RunTestListener}
+      ${'watch-tests'}     | ${undefined}                      | ${listeners.RunTestListener}
+      ${'watch-all-tests'} | ${undefined}                      | ${listeners.RunTestListener}
+      ${'by-file'}         | ${{ testFileNamePattern: 'abc' }} | ${listeners.RunTestListener}
+      ${'list-test-files'} | ${undefined}                      | ${listeners.ListTestFileListener}
     `('schedule $type', ({ type, inputProperty, defaultListener }) => {
       it('with default listener', () => {
         expect.hasAssertions();
@@ -132,31 +109,31 @@ describe('ProcessSession', () => {
         expect(defaultListener).toHaveBeenCalledTimes(1);
       });
     });
-    it('can pass custom requet', () => {
+    it('can pass custom request', () => {
       const sm = createProcessSession(context);
       expect(mockProcessManager).toHaveBeenCalledTimes(1);
-      const extraInfo = 'whatever';
-      sm.scheduleProcess({ type: 'all-tests', extraInfo });
+      const extraInfo: any = 'whatever';
+      sm.scheduleProcess({ type: 'all-tests' }, extraInfo);
       expect(processManagerMock.scheduleJestProcess).toHaveBeenCalled();
       expect(processManagerMock.scheduleJestProcess).toHaveBeenCalledWith(
-        expect.objectContaining({ extraInfo })
+        expect.anything(),
+        extraInfo
       );
     });
   });
 
   describe('start', () => {
     it.each`
-      autoRun                                       | expectedRequests
-      ${'off'}                                      | ${[]}
-      ${{ watch: true, onStartup: ['all-tests'] }}  | ${['all-tests', 'watch-tests']}
-      ${{ watch: true }}                            | ${['watch-tests']}
-      ${{ watch: false, onStartup: ['all-tests'] }} | ${['all-tests']}
+      runMode                                                           | expectedRequests
+      ${new RunMode('on-demand')}                                       | ${[]}
+      ${new RunMode({ type: 'watch', runAllTestsOnStartup: true })}     | ${['all-tests', 'watch-tests']}
+      ${new RunMode('watch')}                                           | ${['watch-tests']}
+      ${new RunMode({ type: 'on-demand', runAllTestsOnStartup: true })} | ${['all-tests']}
     `(
-      'will execute the onStartup processes with autoRun=$autoRun',
-      async ({ autoRun, expectedRequests }) => {
+      'will execute the onStartup processes with runMode=$runMode',
+      async ({ runMode, expectedRequests }) => {
         expect.hasAssertions();
-        const settings: any = { autoRun };
-        context.autoRun = AutoRun(settings);
+        context.settings = { runMode };
         processManagerMock.numberOfProcesses.mockReturnValue(0);
         const session = createProcessSession(context);
         await session.start();
@@ -167,25 +144,39 @@ describe('ProcessSession', () => {
         expect(requestTypes).toEqual(expectedRequests);
       }
     );
+    it('if runAllTestsOnStartup is true, it will run all tests in blocking queue', async () => {
+      expect.hasAssertions();
+      const runMode = new RunMode({ type: 'watch', runAllTestsOnStartup: true });
+      context.settings = { runMode };
+      processManagerMock.numberOfProcesses.mockReturnValue(0);
+      const session = createProcessSession(context);
+      await session.start();
+
+      expect(processManagerMock.scheduleJestProcess).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'all-tests',
+          schedule: expect.objectContaining({ queue: 'blocking' }),
+        }),
+        undefined
+      );
+    });
     it('will clear all process before starting new ones', async () => {
       expect.hasAssertions();
-      const settings: any = { autoRun: { watch: true } };
-      context.autoRun = AutoRun(settings);
+      context.settings = { runMode: new RunMode() };
       processManagerMock.numberOfProcesses.mockReturnValue(1);
       const session = createProcessSession(context);
       await session.start();
-      expect(processManagerMock.stopAll).toBeCalledTimes(1);
-      expect(processManagerMock.scheduleJestProcess).toBeCalledTimes(1);
+      expect(processManagerMock.stopAll).toHaveBeenCalledTimes(1);
+      expect(processManagerMock.scheduleJestProcess).toHaveBeenCalledTimes(1);
     });
   });
   describe('stop', () => {
     it('will stop all processes in the queues', async () => {
       expect.hasAssertions();
-      context.pluginSettings = { autoEnable: true };
       processManagerMock.numberOfProcesses.mockReturnValue(1);
       const session = createProcessSession(context);
       await session.stop();
-      expect(processManagerMock.stopAll).toBeCalledTimes(1);
+      expect(processManagerMock.stopAll).toHaveBeenCalledTimes(1);
     });
   });
 });
